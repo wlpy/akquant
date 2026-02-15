@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use rust_decimal::prelude::*;
 use rust_decimal::Decimal;
 
 use crate::analysis::TradeTracker;
@@ -9,7 +8,6 @@ use crate::history::HistoryBuffer;
 use crate::market::MarketModel;
 use crate::model::{Instrument, Order, OrderStatus, Trade};
 use crate::portfolio::Portfolio;
-use crate::risk::RiskManager;
 
 /// 订单管理器
 /// 负责管理订单列表、成交记录及状态流转
@@ -43,8 +41,9 @@ impl OrderManager {
     }
 
     /// 处理执行报告 (ExecutionReport)
-    /// 更新活跃订单状态，并返回是否生成了成交
+    /// 更新活跃订单状态
     pub fn on_execution_report(&mut self, report: Order) {
+        // Find existing order
         if let Some(existing) = self.active_orders.iter_mut().find(|o| o.id == report.id) {
             existing.status = report.status;
             existing.filled_quantity = report.filled_quantity;
@@ -52,8 +51,11 @@ impl OrderManager {
             existing.updated_at = report.updated_at;
             existing.reject_reason = report.reject_reason;
         } else {
-            // 如果是新的且状态为 Rejected (可能直接被拒)，加入活跃列表以便后续移入历史
-            if report.status == OrderStatus::Rejected {
+            // If it's a new order report (e.g. Rejected immediately), add to active so it can be moved to history later
+            if report.status == OrderStatus::Rejected
+                || report.status == OrderStatus::New
+                || report.status == OrderStatus::Submitted
+            {
                 self.active_orders.push(report);
             }
         }
@@ -89,95 +91,10 @@ impl OrderManager {
         portfolio: &mut Portfolio,
         instruments: &HashMap<String, Instrument>,
         market_model: &dyn MarketModel,
-        risk_manager: &RiskManager,
         history_buffer: &Arc<RwLock<HistoryBuffer>>,
         last_prices: &HashMap<String, Decimal>,
     ) {
-                // 1. Adjust trades for insufficient margin (Dynamic Position Sizing)
-        for trade in trades.iter_mut() {
-            if trade.side == crate::model::OrderSide::Buy {
-                // Calculate estimated commission for the full trade first
-                let instr_opt = instruments.get(&trade.symbol);
-                let mut commission = Decimal::ZERO;
-                if let Some(instr) = instr_opt {
-                    commission = market_model.calculate_commission(
-                        instr,
-                        trade.side,
-                        trade.price,
-                        trade.quantity,
-                    );
-                }
-
-                let multiplier = instr_opt.map(|i| i.multiplier).unwrap_or(Decimal::ONE);
-                let margin_ratio = instr_opt.map(|i| i.margin_ratio).unwrap_or(Decimal::ONE);
-
-                // Margin Required = Price * Qty * Multiplier * MarginRatio
-                let margin_required = trade.price * trade.quantity * multiplier * margin_ratio;
-
-                // Calculate Free Margin (Equity - Used Margin)
-                let free_margin = portfolio.calculate_free_margin(last_prices, instruments);
-
-                // We need: Free Margin >= Margin Required + Commission
-                let total_required = margin_required + commission;
-
-                if total_required > free_margin {
-                    // Insufficient margin, reduce quantity
-                    // Approx: NewQty = FreeMargin / (Price * Multiplier * MarginRatio)
-
-                    let unit_margin = trade.price * multiplier * margin_ratio;
-
-                    let mut ratio = if unit_margin > Decimal::ZERO {
-                        // Use a safer calculation to avoid division by zero or negative
-                        if free_margin <= Decimal::ZERO {
-                             Decimal::ZERO
-                        } else {
-                             free_margin / unit_margin
-                        }
-                    } else {
-                        Decimal::ZERO
-                    };
-
-                    // Apply ratio and round down to lot size
-                    // Use configurable safety factor to avoid rounding issues causing rejection
-                    let safety_margin = risk_manager.config.safety_margin;
-                    let safety_factor = Decimal::from_f64(1.0 - safety_margin)
-                        .unwrap_or(Decimal::from_f64(0.9999).unwrap());
-                    ratio = ratio * safety_factor;
-
-                    let lot_size = instr_opt.map(|i| i.lot_size).unwrap_or(Decimal::ONE);
-                    let mut new_qty = (trade.quantity * ratio).floor();
-                    if lot_size > Decimal::ZERO {
-                        new_qty = new_qty - (new_qty % lot_size);
-                    }
-
-                    // Recalculate to ensure it fits (handling min commission etc)
-                    if let Some(instr) = instr_opt {
-                        let new_comm = market_model.calculate_commission(
-                            instr,
-                            trade.side,
-                            trade.price,
-                            new_qty,
-                        );
-                        let new_margin = trade.price * new_qty * multiplier * margin_ratio;
-
-                        // Check against free margin again
-                        if new_margin + new_comm > free_margin {
-                            // Still too high, reduce by one lot
-                            if new_qty >= lot_size {
-                                new_qty -= lot_size;
-                            } else {
-                                new_qty = Decimal::ZERO;
-                            }
-                        }
-                    }
-
-                    // Update trade quantity
-                    trade.quantity = new_qty;
-                }
-            }
-        }
-
-        // Filter out zero quantity trades
+        // Filter out zero quantity trades (just in case)
         trades.retain(|t| t.quantity > Decimal::ZERO);
 
         for mut trade in trades {
@@ -195,7 +112,7 @@ impl OrderManager {
             // 3. Update Portfolio
             portfolio.adjust_cash(-trade.commission);
 
-            let multiplier = instr_opt.map(|i| i.multiplier).unwrap_or(Decimal::ONE);
+            let multiplier = instr_opt.map(|i| i.multiplier()).unwrap_or(Decimal::ONE);
             let cost = trade.price * trade.quantity * multiplier;
 
             if trade.side == crate::model::OrderSide::Buy {
@@ -209,27 +126,17 @@ impl OrderManager {
             // Update available positions (T+1/T+0 rules)
             if let Some(instr) = instr_opt {
                 market_model.update_available_position(
-                    &mut portfolio.available_positions,
+                    Arc::make_mut(&mut portfolio.available_positions),
                     instr,
                     trade.quantity,
                     trade.side,
                 );
             }
 
-            // 4. Update Order Filled Quantity & Avg Price
+            // 4. Update Order Commission
+            // Note: filled_quantity and average_filled_price are updated via ExecutionReport
+            // in on_execution_report, so we don't need to accumulate them here to avoid double counting.
             if let Some(order) = self.active_orders.iter_mut().find(|o| o.id == trade.order_id) {
-                let old_qty = order.filled_quantity;
-                let old_avg = order.average_filled_price.unwrap_or(Decimal::ZERO);
-                let old_total = old_qty * old_avg;
-
-                let new_trade_val = trade.quantity * trade.price;
-                let new_total = old_total + new_trade_val;
-                let new_qty = old_qty + trade.quantity;
-
-                if new_qty > Decimal::ZERO {
-                    order.average_filled_price = Some(new_total / new_qty);
-                }
-                order.filled_quantity = new_qty;
                 order.commission += trade.commission;
 
                 // Check if fully filled

@@ -29,10 +29,18 @@ pub struct StrategyContext {
     pub canceled_order_ids: Vec<String>, // Accumulated cancellations
     #[pyo3(get)]
     pub active_orders: Vec<Order>, // Existing pending orders
+    #[pyo3(get)]
     pub timers: Vec<Timer>, // Accumulated timers
+
+    // Internal thread-safe storage
+    pub orders_arc: Arc<RwLock<Vec<Order>>>,
+    pub canceled_order_ids_arc: Arc<RwLock<Vec<String>>>,
+    pub active_orders_arc: Arc<Vec<Order>>,
+    pub timers_arc: Arc<RwLock<Vec<Timer>>>,
+
     pub cash: Decimal,
-    pub positions: HashMap<String, Decimal>,
-    pub available_positions: HashMap<String, Decimal>,
+    pub positions: Arc<HashMap<String, Decimal>>,
+    pub available_positions: Arc<HashMap<String, Decimal>>,
     #[pyo3(get)]
     pub session: TradingSession,
     #[pyo3(get)]
@@ -53,11 +61,11 @@ pub struct StrategyContext {
 impl StrategyContext {
     pub fn new(
         cash: Decimal,
-        positions: HashMap<String, Decimal>,
-        available_positions: HashMap<String, Decimal>,
+        positions: Arc<HashMap<String, Decimal>>,
+        available_positions: Arc<HashMap<String, Decimal>>,
         session: TradingSession,
         current_time: i64,
-        active_orders: Vec<Order>,
+        active_orders: Arc<Vec<Order>>,
         closed_trades: Arc<Vec<ClosedTrade>>,
         recent_trades: Vec<Trade>,
         history_buffer: Option<Arc<RwLock<HistoryBuffer>>>,
@@ -67,8 +75,12 @@ impl StrategyContext {
         StrategyContext {
             orders: Vec::new(),
             canceled_order_ids: Vec::new(),
-            active_orders,
+            active_orders: active_orders.as_ref().clone(),
             timers: Vec::new(),
+            orders_arc: Arc::new(RwLock::new(Vec::new())),
+            canceled_order_ids_arc: Arc::new(RwLock::new(Vec::new())),
+            active_orders_arc: active_orders,
+            timers_arc: Arc::new(RwLock::new(Vec::new())),
             cash,
             positions,
             available_positions,
@@ -121,11 +133,15 @@ impl StrategyContext {
         Ok(StrategyContext {
             orders: Vec::new(),
             canceled_order_ids: Vec::new(),
-            active_orders: active_orders.unwrap_or_default(),
+            active_orders: active_orders.clone().unwrap_or_default(),
             timers: Vec::new(),
+            orders_arc: Arc::new(RwLock::new(Vec::new())),
+            canceled_order_ids_arc: Arc::new(RwLock::new(Vec::new())),
+            active_orders_arc: Arc::new(active_orders.unwrap_or_default()),
+            timers_arc: Arc::new(RwLock::new(Vec::new())),
             cash: extract_decimal(cash)?,
-            positions: pos_dec,
-            available_positions: avail_dec,
+            positions: Arc::new(pos_dec),
+            available_positions: Arc::new(avail_dec),
             session: session.unwrap_or(TradingSession::Continuous),
             current_time: current_time.unwrap_or(0),
             closed_trades: Arc::new(closed_trades.unwrap_or_default()),
@@ -192,6 +208,7 @@ impl StrategyContext {
     fn get_positions(&self) -> HashMap<String, f64> {
         self.positions
             .iter()
+            .filter(|(_, v)| !v.is_zero())
             .map(|(k, v)| (k.clone(), v.to_f64().unwrap_or_default()))
             .collect()
     }
@@ -200,6 +217,7 @@ impl StrategyContext {
     fn get_available_positions(&self) -> HashMap<String, f64> {
         self.available_positions
             .iter()
+            .filter(|(_, v)| !v.is_zero())
             .map(|(k, v)| (k.clone(), v.to_f64().unwrap_or_default()))
             .collect()
     }
@@ -214,17 +232,21 @@ impl StrategyContext {
         } else {
             timestamp
         };
-        self.timers.push(Timer {
-            timestamp: normalized,
-            payload,
-        });
+        if let Ok(mut timers) = self.timers_arc.write() {
+            timers.push(Timer {
+                timestamp: normalized,
+                payload,
+            });
+        }
     }
 
     /// 取消订单.
     ///
     /// :param order_id: 订单 ID
     fn cancel_order(&mut self, order_id: String) {
-        self.canceled_order_ids.push(order_id);
+        if let Ok(mut canceled) = self.canceled_order_ids_arc.write() {
+            canceled.push(order_id);
+        }
     }
 
     /// 买入下单.
@@ -285,7 +307,9 @@ impl StrategyContext {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(Event::OrderRequest(order));
         } else {
-            self.orders.push(order);
+            if let Ok(mut orders) = self.orders_arc.write() {
+                orders.push(order);
+            }
         }
         Ok(id)
     }
@@ -348,7 +372,9 @@ impl StrategyContext {
         if let Some(tx) = &self.event_tx {
             let _ = tx.send(Event::OrderRequest(order));
         } else {
-            self.orders.push(order);
+            if let Ok(mut orders) = self.orders_arc.write() {
+                orders.push(order);
+            }
         }
         Ok(id)
     }

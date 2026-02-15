@@ -1,0 +1,34 @@
+use crate::event::Event;
+use crate::execution::common::CommonMatcher;
+use crate::execution::matcher::ExecutionMatcher;
+use crate::execution::slippage::SlippageModel;
+use crate::model::{ExecutionMode, Instrument, Order};
+use rust_decimal::Decimal;
+
+pub struct StockMatcher;
+
+impl ExecutionMatcher for StockMatcher {
+    fn match_order(
+        &self,
+        order: &mut Order,
+        event: &Event,
+        instrument: &Instrument,
+        execution_mode: ExecutionMode,
+        slippage: &dyn SlippageModel,
+        volume_limit_pct: Decimal,
+        bar_index: usize,
+    ) -> Option<Event> {
+        // Stock specific logic can be added here
+        // For now, delegate to common matcher
+        // TODO: Add limit up/down check (Price Limit)
+        CommonMatcher::match_order(
+            order,
+            event,
+            instrument,
+            execution_mode,
+            slippage,
+            volume_limit_pct,
+            bar_index,
+        )
+    }
+}

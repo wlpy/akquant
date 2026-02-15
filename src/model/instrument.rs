@@ -6,6 +6,44 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StockInstrument {
+    pub symbol: String,
+    pub lot_size: Decimal,
+    pub tick_size: Decimal,
+    // Add other stock-specific fields if needed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundInstrument {
+    pub symbol: String,
+    pub lot_size: Decimal,
+    pub tick_size: Decimal,
+    // Add other fund-specific fields if needed
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuturesInstrument {
+    pub symbol: String,
+    pub multiplier: Decimal,
+    pub margin_ratio: Decimal,
+    pub tick_size: Decimal,
+    pub expiry_date: Option<u32>,
+    pub settlement_type: Option<SettlementType>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionInstrument {
+    pub symbol: String,
+    pub multiplier: Decimal,
+    pub tick_size: Decimal,
+    pub option_type: OptionType,
+    pub strike_price: Decimal,
+    pub expiry_date: u32,
+    pub underlying_symbol: String,
+    pub settlement_type: Option<SettlementType>,
+}
+
 #[gen_stub_pyclass]
 #[pyclass]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,18 +56,16 @@ use serde::{Deserialize, Serialize};
 /// :ivar tick_size: 最小变动价位
 pub struct Instrument {
     #[pyo3(get)]
-    pub symbol: String,
-    #[pyo3(get)]
     pub asset_type: AssetType,
-    pub multiplier: Decimal,   // 合约乘数 (股票为1.0)
-    pub margin_ratio: Decimal, // 保证金比率 (股票为1.0)
-    pub tick_size: Decimal,    // 最小变动价位
-    pub option_type: Option<OptionType>,
-    pub strike_price: Option<Decimal>,
-    pub expiry_date: Option<u32>,
-    pub lot_size: Decimal,
-    pub underlying_symbol: Option<String>,
-    pub settlement_type: Option<SettlementType>,
+    pub inner: InstrumentEnum,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum InstrumentEnum {
+    Stock(StockInstrument),
+    Fund(FundInstrument),
+    Futures(FuturesInstrument),
+    Option(OptionInstrument),
 }
 
 #[gen_stub_pymethods]
@@ -94,54 +130,194 @@ impl Instrument {
             Decimal::from(1)
         };
 
-        Ok(Instrument {
-            symbol,
-            asset_type,
-            multiplier: mult,
-            margin_ratio: margin,
-            tick_size: tick,
-            option_type,
-            strike_price: strike,
-            expiry_date,
-            lot_size: lot,
-            underlying_symbol,
-            settlement_type,
-        })
+        let inner = match asset_type {
+            AssetType::Stock => InstrumentEnum::Stock(StockInstrument {
+                symbol: symbol.clone(),
+                lot_size: lot,
+                tick_size: tick,
+            }),
+            AssetType::Fund => InstrumentEnum::Fund(FundInstrument {
+                symbol: symbol.clone(),
+                lot_size: lot,
+                tick_size: tick,
+            }),
+            AssetType::Futures => InstrumentEnum::Futures(FuturesInstrument {
+                symbol: symbol.clone(),
+                multiplier: mult,
+                margin_ratio: margin,
+                tick_size: tick,
+                expiry_date,
+                settlement_type,
+            }),
+            AssetType::Option => {
+                // Ensure required fields for Option are present
+                let opt_type = option_type.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("Option type required for Option")
+                })?;
+                let strike_val = strike.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("Strike price required for Option")
+                })?;
+                let expiry_val = expiry_date.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("Expiry date required for Option")
+                })?;
+                let underlying_val = underlying_symbol.ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err("Underlying symbol required for Option")
+                })?;
+
+                InstrumentEnum::Option(OptionInstrument {
+                    symbol: symbol.clone(),
+                    multiplier: mult,
+                    tick_size: tick,
+                    option_type: opt_type,
+                    strike_price: strike_val,
+                    expiry_date: expiry_val,
+                    underlying_symbol: underlying_val,
+                    settlement_type,
+                })
+            }
+        };
+
+        Ok(Instrument { asset_type, inner })
+    }
+
+    #[getter]
+    fn get_symbol(&self) -> String {
+        match &self.inner {
+            InstrumentEnum::Stock(s) => s.symbol.clone(),
+            InstrumentEnum::Fund(f) => f.symbol.clone(),
+            InstrumentEnum::Futures(f) => f.symbol.clone(),
+            InstrumentEnum::Option(o) => o.symbol.clone(),
+        }
     }
 
     #[getter]
     /// 获取合约乘数.
     /// :return: 合约乘数
     fn get_multiplier(&self) -> f64 {
-        self.multiplier.to_f64().unwrap_or_default()
+        match &self.inner {
+            InstrumentEnum::Futures(f) => f.multiplier.to_f64().unwrap_or_default(),
+            InstrumentEnum::Option(o) => o.multiplier.to_f64().unwrap_or_default(),
+            _ => 1.0,
+        }
     }
 
     #[getter]
     /// 获取保证金比率.
     /// :return: 保证金比率
     fn get_margin_ratio(&self) -> f64 {
-        self.margin_ratio.to_f64().unwrap_or_default()
+        match &self.inner {
+            InstrumentEnum::Futures(f) => f.margin_ratio.to_f64().unwrap_or_default(),
+            _ => 1.0,
+        }
     }
 
     #[getter]
     /// 获取最小变动价位.
     /// :return: 最小变动价位
     fn get_tick_size(&self) -> f64 {
-        self.tick_size.to_f64().unwrap_or_default()
+        match &self.inner {
+            InstrumentEnum::Stock(s) => s.tick_size.to_f64().unwrap_or_default(),
+            InstrumentEnum::Fund(f) => f.tick_size.to_f64().unwrap_or_default(),
+            InstrumentEnum::Futures(f) => f.tick_size.to_f64().unwrap_or_default(),
+            InstrumentEnum::Option(o) => o.tick_size.to_f64().unwrap_or_default(),
+        }
     }
 
     #[getter]
     /// 获取最小交易单位.
     /// :return: 最小交易单位
     fn get_lot_size(&self) -> f64 {
-        self.lot_size.to_f64().unwrap_or_default()
+        match &self.inner {
+            InstrumentEnum::Stock(s) => s.lot_size.to_f64().unwrap_or_default(),
+            InstrumentEnum::Fund(f) => f.lot_size.to_f64().unwrap_or_default(),
+            InstrumentEnum::Futures(_) => 1.0,
+            InstrumentEnum::Option(_) => 1.0,
+        }
     }
 
     #[setter]
     /// 设置最小交易单位.
     /// :param value: 最小交易单位
     fn set_lot_size(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
-        self.lot_size = extract_decimal(value)?;
+        let val = extract_decimal(value)?;
+        match &mut self.inner {
+            InstrumentEnum::Stock(s) => s.lot_size = val,
+            InstrumentEnum::Fund(f) => f.lot_size = val,
+            _ => {} // Ignore for others or raise error?
+        }
         Ok(())
+    }
+}
+
+// Add public accessors for internal Rust usage to avoid breaking changes everywhere immediately
+impl Instrument {
+    pub fn symbol(&self) -> &str {
+        match &self.inner {
+            InstrumentEnum::Stock(s) => &s.symbol,
+            InstrumentEnum::Fund(f) => &f.symbol,
+            InstrumentEnum::Futures(f) => &f.symbol,
+            InstrumentEnum::Option(o) => &o.symbol,
+        }
+    }
+
+    pub fn multiplier(&self) -> Decimal {
+        match &self.inner {
+            InstrumentEnum::Futures(f) => f.multiplier,
+            InstrumentEnum::Option(o) => o.multiplier,
+            _ => Decimal::ONE,
+        }
+    }
+
+    pub fn margin_ratio(&self) -> Decimal {
+        match &self.inner {
+            InstrumentEnum::Futures(f) => f.margin_ratio,
+            _ => Decimal::ONE,
+        }
+    }
+
+    pub fn lot_size(&self) -> Decimal {
+        match &self.inner {
+            InstrumentEnum::Stock(s) => s.lot_size,
+            InstrumentEnum::Fund(f) => f.lot_size,
+            _ => Decimal::ONE,
+        }
+    }
+
+    pub fn tick_size(&self) -> Decimal {
+        match &self.inner {
+            InstrumentEnum::Stock(s) => s.tick_size,
+            InstrumentEnum::Fund(f) => f.tick_size,
+            InstrumentEnum::Futures(f) => f.tick_size,
+            InstrumentEnum::Option(o) => o.tick_size,
+        }
+    }
+
+    pub fn expiry_date(&self) -> Option<u32> {
+        match &self.inner {
+            InstrumentEnum::Futures(f) => f.expiry_date,
+            InstrumentEnum::Option(o) => Some(o.expiry_date),
+            _ => None,
+        }
+    }
+
+    pub fn underlying_symbol(&self) -> Option<&String> {
+        match &self.inner {
+            InstrumentEnum::Option(o) => Some(&o.underlying_symbol),
+            _ => None,
+        }
+    }
+
+    pub fn strike_price(&self) -> Option<Decimal> {
+        match &self.inner {
+            InstrumentEnum::Option(o) => Some(o.strike_price),
+            _ => None,
+        }
+    }
+
+    pub fn option_type(&self) -> Option<OptionType> {
+        match &self.inner {
+            InstrumentEnum::Option(o) => Some(o.option_type),
+            _ => None,
+        }
     }
 }

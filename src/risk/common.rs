@@ -1,0 +1,248 @@
+use crate::error::AkQuantError;
+use crate::model::{Instrument, Order, OrderSide};
+use crate::portfolio::Portfolio;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use std::collections::HashMap;
+
+use super::rule::RiskRule;
+use super::RiskConfig;
+
+/// Check restricted list
+#[derive(Debug, Clone)]
+pub struct RestrictedListRule;
+
+impl RiskRule for RestrictedListRule {
+    fn name(&self) -> &'static str {
+        "RestrictedListRule"
+    }
+
+    fn check(
+        &self,
+        order: &Order,
+        _portfolio: &Portfolio,
+        _instrument: &Instrument,
+        _instruments: &HashMap<String, Instrument>,
+        _active_orders: &[Order],
+        _current_prices: &HashMap<String, Decimal>,
+        config: &RiskConfig,
+    ) -> Result<(), AkQuantError> {
+        if config.restricted_list.contains(&order.symbol) {
+            return Err(AkQuantError::OrderError(format!(
+                "Risk: Symbol {} is restricted",
+                order.symbol
+            )));
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn RiskRule> {
+        Box::new(self.clone())
+    }
+}
+
+/// Check max order size
+#[derive(Debug, Clone)]
+pub struct MaxOrderSizeRule;
+
+impl RiskRule for MaxOrderSizeRule {
+    fn name(&self) -> &'static str {
+        "MaxOrderSizeRule"
+    }
+
+    fn check(
+        &self,
+        order: &Order,
+        _portfolio: &Portfolio,
+        _instrument: &Instrument,
+        _instruments: &HashMap<String, Instrument>,
+        _active_orders: &[Order],
+        _current_prices: &HashMap<String, Decimal>,
+        config: &RiskConfig,
+    ) -> Result<(), AkQuantError> {
+        if let Some(max_size) = config.max_order_size {
+            if order.quantity > max_size {
+                return Err(AkQuantError::OrderError(format!(
+                    "Risk: Order quantity {} exceeds limit {}",
+                    order.quantity, max_size
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn RiskRule> {
+        Box::new(self.clone())
+    }
+}
+
+/// Check max order value
+#[derive(Debug, Clone)]
+pub struct MaxOrderValueRule;
+
+impl RiskRule for MaxOrderValueRule {
+    fn name(&self) -> &'static str {
+        "MaxOrderValueRule"
+    }
+
+    fn check(
+        &self,
+        order: &Order,
+        _portfolio: &Portfolio,
+        _instrument: &Instrument,
+        _instruments: &HashMap<String, Instrument>,
+        _active_orders: &[Order],
+        current_prices: &HashMap<String, Decimal>,
+        config: &RiskConfig,
+    ) -> Result<(), AkQuantError> {
+        if let Some(max_value) = config.max_order_value {
+            let price = if let Some(p) = order.price {
+                Some(p)
+            } else {
+                current_prices.get(&order.symbol).cloned()
+            };
+
+            if let Some(p) = price {
+                let value = p * order.quantity;
+                if value > max_value {
+                    return Err(AkQuantError::OrderError(format!(
+                        "Risk: Order value {} exceeds limit {}",
+                        value, max_value
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn RiskRule> {
+        Box::new(self.clone())
+    }
+}
+
+/// Check max position size
+#[derive(Debug, Clone)]
+pub struct MaxPositionSizeRule;
+
+impl RiskRule for MaxPositionSizeRule {
+    fn name(&self) -> &'static str {
+        "MaxPositionSizeRule"
+    }
+
+    fn check(
+        &self,
+        order: &Order,
+        portfolio: &Portfolio,
+        _instrument: &Instrument,
+        _instruments: &HashMap<String, Instrument>,
+        _active_orders: &[Order],
+        _current_prices: &HashMap<String, Decimal>,
+        config: &RiskConfig,
+    ) -> Result<(), AkQuantError> {
+        if let Some(max_pos) = config.max_position_size {
+            let current_pos = portfolio
+                .positions
+                .get(&order.symbol)
+                .cloned()
+                .unwrap_or(Decimal::ZERO);
+            let new_pos = match order.side {
+                OrderSide::Buy => current_pos + order.quantity,
+                OrderSide::Sell => current_pos - order.quantity,
+            };
+            if new_pos.abs() > max_pos {
+                return Err(AkQuantError::OrderError(format!(
+                    "Risk: Resulting position {} exceeds limit {}",
+                    new_pos, max_pos
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn RiskRule> {
+        Box::new(self.clone())
+    }
+}
+
+/// Check cash / margin sufficiency
+#[derive(Debug, Clone)]
+pub struct CashMarginRule;
+
+impl RiskRule for CashMarginRule {
+    fn name(&self) -> &'static str {
+        "CashMarginRule"
+    }
+
+    fn check(
+        &self,
+        order: &Order,
+        portfolio: &Portfolio,
+        instrument: &Instrument,
+        instruments: &HashMap<String, Instrument>,
+        active_orders: &[Order],
+        current_prices: &HashMap<String, Decimal>,
+        config: &RiskConfig,
+    ) -> Result<(), AkQuantError> {
+        if config.check_cash && order.side == OrderSide::Buy {
+            let mut required_margin = Decimal::ZERO;
+            let mut price_found = false;
+
+            // Get instrument info for multiplier and margin_ratio
+            let multiplier = instrument.multiplier();
+            let margin_ratio = instrument.margin_ratio();
+
+            // Determine price for current order
+            if let Some(p) = order.price {
+                required_margin = p * order.quantity * multiplier * margin_ratio;
+                price_found = true;
+            } else if let Some(p) = current_prices.get(&order.symbol) {
+                required_margin = *p * order.quantity * multiplier * margin_ratio;
+                price_found = true;
+            }
+
+            if price_found {
+                // Check Active Buy Orders for committed margin
+                let mut committed_margin = Decimal::ZERO;
+                for o in active_orders {
+                    if o.side == OrderSide::Buy && o.status == crate::model::OrderStatus::New {
+                        let (o_mult, o_margin_ratio) = if let Some(instr) = instruments.get(&o.symbol) {
+                            (instr.multiplier(), instr.margin_ratio())
+                        } else {
+                            (Decimal::ONE, Decimal::ONE)
+                        };
+
+                        if let Some(p) = o.price {
+                             committed_margin += p * o.quantity * o_mult * o_margin_ratio;
+                        } else if let Some(p) = current_prices.get(&o.symbol) {
+                             committed_margin += *p * o.quantity * o_mult * o_margin_ratio;
+                        }
+                    }
+                }
+
+                // Calculate Free Margin
+                let free_margin = portfolio.calculate_free_margin(current_prices, instruments);
+
+                // Apply Safety Margin (default 0.0001 or user config)
+                let safety_margin = config.safety_margin;
+                // Safety factor = 1.0 - margin (e.g., 0.9999)
+                let safety_factor = Decimal::from_f64(1.0 - safety_margin).unwrap_or(Decimal::from_f64(0.9999).unwrap());
+
+                // Available Margin = (Free Margin - Committed Margin) * Safety Factor
+                // Note: Free Margin already accounts for Used Margin of existing positions
+                let available_margin = (free_margin - committed_margin) * safety_factor;
+
+                if required_margin > available_margin {
+                     return Err(AkQuantError::OrderError(format!(
+                        "Risk: Insufficient margin. Required: {}, Available: {} (Free: {}, Committed: {}, Safety: {})",
+                        required_margin, available_margin, free_margin, committed_margin, safety_margin
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_box(&self) -> Box<dyn RiskRule> {
+        Box::new(self.clone())
+    }
+}
