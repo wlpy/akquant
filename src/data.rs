@@ -1,6 +1,7 @@
 use crate::error::AkQuantError;
 use crate::event::Event;
 use crate::model::{Bar, Tick};
+use chrono::Utc;
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -565,6 +566,131 @@ impl DataFeed {
         let provider = self.provider.lock().unwrap();
         provider.is_live()
     }
+
+    /// 等待下一个事件或直到下一个定时器触发 (用于实时模式)
+    ///
+    /// :param next_timer_timestamp: 下一个定时器的时间戳 (纳秒)
+    /// :param py: Python 解释器 (用于释放 GIL)
+    /// :return: 下一个事件的时间戳 (如果有)
+    pub fn wait_next_event_or_timer(
+        &self,
+        next_timer_timestamp: Option<i64>,
+        py: Python<'_>,
+    ) -> Option<i64> {
+        // If backtest mode (not live), return immediately
+        if !self.is_live() {
+            return self.peek_timestamp();
+        }
+
+        // Calculate timeout
+        let timeout = if let Some(timer_ts) = next_timer_timestamp {
+            let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            if timer_ts > now {
+                let diff_ms = (timer_ts - now) / 1_000_000;
+                if diff_ms > 0 {
+                    Duration::from_millis(std::cmp::min(diff_ms as u64, 1000))
+                } else {
+                    Duration::ZERO
+                }
+            } else {
+                Duration::ZERO
+            }
+        } else {
+            Duration::from_secs(1)
+        };
+
+        if timeout > Duration::ZERO {
+            let feed_clone = self.clone();
+            // Release GIL and wait
+            #[allow(deprecated)]
+            py.allow_threads(move || feed_clone.wait_peek(timeout))
+        } else {
+            self.peek_timestamp()
+        }
+    }
+
+    /// 获取下一个动作 (事件或定时器)
+    pub fn next_action(&self, next_timer_ts: Option<i64>, py: Python) -> FeedAction {
+        if !self.is_live() {
+             let peek_ts = self.peek_timestamp();
+
+             // Backtest logic
+             match (peek_ts, next_timer_ts) {
+                 (Some(et), Some(tt)) => {
+                     if tt <= et {
+                         return FeedAction::Timer(tt);
+                     } else {
+                         return FeedAction::Event(self.next().unwrap());
+                     }
+                 },
+                 (Some(_), None) => return FeedAction::Event(self.next().unwrap()),
+                 (None, Some(tt)) => return FeedAction::Timer(tt),
+                 (None, None) => return FeedAction::End,
+             }
+        } else {
+            // Live logic
+            // Calculate timeout
+            let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            let timeout = if let Some(tt) = next_timer_ts {
+                if tt > now {
+                    let diff_ms = (tt - now) / 1_000_000;
+                    Duration::from_millis(std::cmp::min(diff_ms as u64, 1000))
+                } else {
+                    Duration::ZERO
+                }
+            } else {
+                Duration::from_secs(1)
+            };
+
+            let next_ts_opt = if timeout > Duration::ZERO {
+                let feed_clone = self.clone();
+                // Release GIL and wait
+                #[allow(deprecated)]
+                py.allow_threads(move || feed_clone.wait_peek(timeout))
+            } else {
+                self.peek_timestamp()
+            };
+
+            match next_ts_opt {
+                Some(et) => {
+                    // Event available
+                    if let Some(tt) = next_timer_ts {
+                        if tt <= et {
+                             // Timer is earlier than event (and we are here so timer might be due or close?)
+                             // In Live, check if timer is actually DUE (<= now).
+                             if tt <= now {
+                                 return FeedAction::Timer(tt);
+                             } else {
+                                 // Timer not due, but event is here.
+                                 return FeedAction::Event(self.next().unwrap());
+                             }
+                        } else {
+                             // Event is earlier than timer
+                             return FeedAction::Event(self.next().unwrap());
+                        }
+                    } else {
+                        return FeedAction::Event(self.next().unwrap());
+                    }
+                },
+                None => {
+                    // Timeout (No event)
+                    if let Some(tt) = next_timer_ts {
+                        if tt <= now {
+                            return FeedAction::Timer(tt);
+                        }
+                    }
+                    return FeedAction::Wait;
+                }
+            }
+        }
+    }
+}
+
+pub enum FeedAction {
+    Event(Event),
+    Timer(i64),
+    Wait,
+    End,
 }
 
 // ----------------------------------------------------------------------------

@@ -82,7 +82,7 @@ impl ClosedTrade {
 
 #[gen_stub_pyclass]
 #[pyclass]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 /// 绩效指标.
 ///
 /// :ivar total_return: 总收益 (数值)

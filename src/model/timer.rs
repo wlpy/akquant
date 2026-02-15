@@ -1,8 +1,14 @@
+use pyo3::prelude::*;
+use pyo3_stub_gen::derive::*;
 use std::cmp::Ordering;
 
+#[gen_stub_pyclass]
+#[pyclass]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Timer {
+    #[pyo3(get, set)]
     pub timestamp: i64,
+    #[pyo3(get, set)]
     pub payload: String,
 }
 

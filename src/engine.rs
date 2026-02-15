@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -6,7 +6,6 @@ use pyo3_stub_gen::derive::*;
 use rust_decimal::prelude::*;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use crate::analysis::{BacktestResult, PositionSnapshot};
 use crate::clock::Clock;
@@ -16,15 +15,20 @@ use crate::event::Event;
 use crate::event_manager::EventManager;
 use crate::execution::{ExecutionClient, RealtimeExecutionClient, SimulatedExecutionClient};
 use crate::history::HistoryBuffer;
-use crate::market::{
-    ChinaMarketConfig, MarketConfig, MarketModel, SessionRange,
-};
+use crate::market::manager::MarketManager;
 use crate::model::{
-    Bar, ExecutionMode, Instrument, Order, OrderStatus, TimeInForce, Timer, Trade, TradingSession,
+    Bar, ExecutionMode, Instrument, Order, Timer, Trade, TradingSession,
 };
 use crate::order_manager::OrderManager;
+use crate::pipeline::stages::{
+    ChannelProcessor, CleanupProcessor, DataProcessor, ExecutionProcessor, StatisticsProcessor,
+    StrategyProcessor,
+};
+use crate::pipeline::PipelineRunner;
 use crate::portfolio::Portfolio;
 use crate::risk::{RiskConfig, RiskManager};
+use crate::settlement::SettlementManager;
+use crate::statistics::StatisticsManager;
 
 /// 主回测引擎.
 ///
@@ -35,30 +39,32 @@ use crate::risk::{RiskConfig, RiskManager};
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct Engine {
-    feed: DataFeed,
+    pub(crate) feed: DataFeed,
     #[pyo3(get)]
-    portfolio: Portfolio,
-    last_prices: HashMap<String, Decimal>,
-    instruments: HashMap<String, Instrument>,
-    current_date: Option<NaiveDate>,
-    market_config: MarketConfig,
-    market_model: Box<dyn MarketModel>,
-    execution_model: Box<dyn ExecutionClient>,
-    equity_curve: Vec<(i64, Decimal)>,
-    cash_curve: Vec<(i64, Decimal)>,
-    pub snapshots: Vec<(i64, Vec<PositionSnapshot>)>,
-    execution_mode: ExecutionMode,
-    clock: Clock,
-    timers: BinaryHeap<Timer>, // Min-Heap via Timer's Ord implementation
-    force_session_continuous: bool,
+    pub(crate) portfolio: Portfolio,
+    pub(crate) last_prices: HashMap<String, Decimal>,
+    pub(crate) instruments: HashMap<String, Instrument>,
+    pub(crate) current_date: Option<NaiveDate>,
+    pub(crate) market_manager: MarketManager,
+    pub(crate) execution_model: Box<dyn ExecutionClient>,
+    pub(crate) execution_mode: ExecutionMode,
+    pub(crate) clock: Clock,
+    pub(crate) timers: BinaryHeap<Timer>, // Min-Heap via Timer's Ord implementation
+    pub(crate) force_session_continuous: bool,
     #[pyo3(get, set)]
     pub risk_manager: RiskManager,
-    timezone_offset: i32,
-    history_buffer: Arc<RwLock<HistoryBuffer>>,
-    initial_capital: Decimal,
+    pub(crate) timezone_offset: i32,
+    pub(crate) history_buffer: Arc<RwLock<HistoryBuffer>>,
+    pub(crate) initial_capital: Decimal,
     // Components
-    order_manager: OrderManager,
-    event_manager: EventManager,
+    pub(crate) order_manager: OrderManager,
+    pub(crate) event_manager: EventManager,
+    pub(crate) statistics_manager: StatisticsManager,
+    pub(crate) settlement_manager: SettlementManager,
+    // Pipeline state
+    pub(crate) current_event: Option<Event>,
+    pub(crate) bar_count: usize,
+    pub(crate) progress_bar: Option<ProgressBar>,
 }
 
 #[gen_stub_pymethods]
@@ -76,6 +82,12 @@ impl Engine {
         self.order_manager.trades.clone()
     }
 
+    /// 获取持仓快照历史
+    #[getter]
+    fn get_snapshots(&self) -> Vec<(i64, Vec<PositionSnapshot>)> {
+        self.statistics_manager.snapshots.clone()
+    }
+
     /// 设置风控配置
     ///
     /// 由于 PyO3 对嵌套结构体的属性访问可能返回副本，
@@ -91,23 +103,18 @@ impl Engine {
     /// :return: Engine 实例
     #[new]
     fn new() -> Self {
-        let market_config = MarketConfig::default();
         Engine {
             feed: DataFeed::new(),
             portfolio: Portfolio {
                 cash: Decimal::from(100_000),
-                positions: HashMap::new(),
-                available_positions: HashMap::new(),
+                positions: Arc::new(HashMap::new()),
+                available_positions: Arc::new(HashMap::new()),
             },
             last_prices: HashMap::new(),
             instruments: HashMap::new(),
             current_date: None,
-            market_config: market_config.clone(),
-            market_model: market_config.create_model(),
+            market_manager: MarketManager::new(),
             execution_model: Box::new(SimulatedExecutionClient::new()),
-            equity_curve: Vec::new(),
-            cash_curve: Vec::new(),
-            snapshots: Vec::new(),
             execution_mode: ExecutionMode::NextOpen,
             clock: Clock::new(),
             timers: BinaryHeap::new(),
@@ -118,6 +125,11 @@ impl Engine {
             initial_capital: Decimal::from(100_000),
             order_manager: OrderManager::new(),
             event_manager: EventManager::new(),
+            statistics_manager: StatisticsManager::new(),
+            settlement_manager: SettlementManager::new(),
+            current_event: None,
+            bar_count: 0,
+            progress_bar: None,
         }
     }
 
@@ -162,27 +174,12 @@ impl Engine {
     ///
     /// :param commission_rate: 佣金率
     fn use_simple_market(&mut self, commission_rate: f64) {
-        let mut config = crate::market::SimpleMarketConfig::default();
-        config.commission_rate = Decimal::from_f64(commission_rate).unwrap_or(Decimal::ZERO);
-        self.market_config = MarketConfig::Simple(config);
-        self.market_model = self.market_config.create_model();
+        self.market_manager.use_simple_market(commission_rate);
     }
 
     /// 启用 ChinaMarket (支持 T+1/T+0, 印花税, 过户费, 交易时段等)
     fn use_china_market(&mut self) {
-        self.market_config = MarketConfig::China(ChinaMarketConfig::default());
-        self.market_model = self.market_config.create_model();
-    }
-
-    /// 启用中国期货市场默认配置
-    /// - 切换到 ChinaMarket
-    /// - 设置 T+0
-    /// - 保持当前交易时段配置 (需手动设置 set_market_sessions 以匹配特定品种)
-    fn use_china_futures_market(&mut self) {
-        let mut config = ChinaMarketConfig::default();
-        config.t_plus_one = false;
-        self.market_config = MarketConfig::China(config);
-        self.market_model = self.market_config.create_model();
+        self.market_manager.use_china_market();
     }
 
     /// 启用/禁用 T+1 交易规则 (仅针对 ChinaMarket)
@@ -190,10 +187,7 @@ impl Engine {
     /// :param enabled: 是否启用 T+1
     /// :type enabled: bool
     fn set_t_plus_one(&mut self, enabled: bool) {
-        if let MarketConfig::China(ref mut c) = self.market_config {
-            c.t_plus_one = enabled;
-            self.market_model = self.market_config.create_model();
-        }
+        self.market_manager.set_t_plus_one(enabled);
     }
 
     /// 强制连续交易时段
@@ -203,84 +197,16 @@ impl Engine {
         self.force_session_continuous = enabled;
     }
 
-    /// 处理期权到期交割/行权
-    fn process_option_expiry(&mut self, date: NaiveDate) {
-        use crate::model::types::{AssetType, OptionType};
+    /// 启用中国期货市场默认配置
+    /// - 切换到 ChinaMarket
+    /// - 设置 T+0
+    /// - 保持当前交易时段配置 (需手动设置 set_market_sessions 以匹配特定品种)
+    fn use_china_futures_market(&mut self) {
+        self.market_manager.use_china_futures_market();
+    }
 
-        // Identify expired options
-        let mut expired_positions = Vec::new();
-
-        for (symbol, qty) in &self.portfolio.positions {
-            if *qty == Decimal::ZERO {
-                continue;
-            }
-
-            if let Some(instr) = self.instruments.get(symbol) {
-                if instr.asset_type == AssetType::Option {
-                    if let Some(expiry_date_int) = instr.expiry_date {
-                        // expiry_date is u32 YYYYMMDD
-                        // Convert NaiveDate to YYYYMMDD u32
-                        let current_date_int = (date.year() as u32) * 10000
-                            + (date.month() as u32) * 100
-                            + (date.day() as u32);
-
-                        if current_date_int >= expiry_date_int {
-                            expired_positions.push(symbol.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Process expiration
-        for symbol in expired_positions {
-            let qty = self.portfolio.positions.get(&symbol).cloned().unwrap();
-            let instr = self.instruments.get(&symbol).unwrap().clone();
-
-            // Default to Cash Settlement for now if not specified
-            // Logic: Payoff = Max(0, S - K) for Call, Max(0, K - S) for Put
-            let strike = instr.strike_price.unwrap_or(Decimal::ZERO);
-            let underlying_price = if let Some(us) = &instr.underlying_symbol {
-                self.last_prices.get(us).cloned().unwrap_or(Decimal::ZERO)
-            } else {
-                Decimal::ZERO
-            };
-
-            let mut payoff_per_unit = Decimal::ZERO;
-            if underlying_price > Decimal::ZERO {
-                match instr.option_type {
-                    Some(OptionType::Call) => {
-                        if underlying_price > strike {
-                            payoff_per_unit = underlying_price - strike;
-                        }
-                    }
-                    Some(OptionType::Put) => {
-                        if strike > underlying_price {
-                            payoff_per_unit = strike - underlying_price;
-                        }
-                    }
-                    None => {}
-                }
-            }
-
-            // Total PnL impact
-            // Long (Qty > 0): Receives Payoff * Multiplier * Qty
-            // Short (Qty < 0): Pays Payoff * Multiplier * Abs(Qty) -> Same formula works: Qty * Payoff * Multiplier
-            let cash_flow = qty * payoff_per_unit * instr.multiplier;
-
-            // Apply Cash Flow
-            if !cash_flow.is_zero() {
-                self.portfolio.adjust_cash(cash_flow);
-            }
-
-            // Close Position
-            self.portfolio.positions.remove(&symbol);
-            self.portfolio.available_positions.remove(&symbol);
-
-            // Record Trade (Optional: Record an "Expiry" trade for tracking?)
-            // For now, we just adjust cash and remove position.
-            // Ideally we should create a Trade record with type "Exercise" or "Expire".
-        }
+    fn process_option_expiry(&mut self, _local_date: NaiveDate) {
+        // Deprecated: logic moved to SettlementManager
     }
 
     /// 设置股票费率规则
@@ -296,35 +222,19 @@ impl Engine {
         transfer_fee: f64,
         min_commission: f64,
     ) {
-        match &mut self.market_config {
-            MarketConfig::China(c) => {
-                c.stock_commission_rate =
-                    Decimal::from_f64(commission_rate).unwrap_or(Decimal::ZERO);
-                c.stock_stamp_tax = Decimal::from_f64(stamp_tax).unwrap_or(Decimal::ZERO);
-                c.stock_transfer_fee =
-                    Decimal::from_f64(transfer_fee).unwrap_or(Decimal::ZERO);
-                c.stock_min_commission =
-                    Decimal::from_f64(min_commission).unwrap_or(Decimal::ZERO);
-            }
-            MarketConfig::Simple(c) => {
-                c.commission_rate = Decimal::from_f64(commission_rate).unwrap_or(Decimal::ZERO);
-                c.stamp_tax = Decimal::from_f64(stamp_tax).unwrap_or(Decimal::ZERO);
-                c.transfer_fee = Decimal::from_f64(transfer_fee).unwrap_or(Decimal::ZERO);
-                c.min_commission = Decimal::from_f64(min_commission).unwrap_or(Decimal::ZERO);
-            }
-        }
-        self.market_model = self.market_config.create_model();
+        self.market_manager.set_stock_fee_rules(
+            commission_rate,
+            stamp_tax,
+            transfer_fee,
+            min_commission,
+        );
     }
 
     /// 设置期货费率规则
     ///
     /// :param commission_rate: 佣金率 (如 0.0001)
     fn set_future_fee_rules(&mut self, commission_rate: f64) {
-        if let MarketConfig::China(ref mut c) = self.market_config {
-            c.future_commission_rate =
-                Decimal::from_f64(commission_rate).unwrap_or(Decimal::ZERO);
-            self.market_model = self.market_config.create_model();
-        }
+        self.market_manager.set_future_fee_rules(commission_rate);
     }
 
     /// 设置基金费率规则
@@ -333,26 +243,14 @@ impl Engine {
     /// :param transfer_fee: 过户费率
     /// :param min_commission: 最低佣金
     fn set_fund_fee_rules(&mut self, commission_rate: f64, transfer_fee: f64, min_commission: f64) {
-        if let MarketConfig::China(ref mut c) = self.market_config {
-            c.fund_commission_rate =
-                Decimal::from_f64(commission_rate).unwrap_or(Decimal::ZERO);
-            c.fund_transfer_fee =
-                Decimal::from_f64(transfer_fee).unwrap_or(Decimal::ZERO);
-            c.fund_min_commission =
-                Decimal::from_f64(min_commission).unwrap_or(Decimal::ZERO);
-            self.market_model = self.market_config.create_model();
-        }
+        self.market_manager.set_fund_fee_rules(commission_rate, transfer_fee, min_commission);
     }
 
     /// 设置期权费率规则
     ///
     /// :param commission_per_contract: 每张合约佣金 (如 5.0)
     fn set_option_fee_rules(&mut self, commission_per_contract: f64) {
-        if let MarketConfig::China(ref mut c) = self.market_config {
-            c.option_commission_per_contract =
-                Decimal::from_f64(commission_per_contract).unwrap_or(Decimal::ZERO);
-            self.market_model = self.market_config.create_model();
-        }
+        self.market_manager.set_option_fee_rules(commission_per_contract);
     }
 
     /// 设置滑点模型
@@ -411,16 +309,9 @@ impl Engine {
         for (start, end, session) in sessions {
             let start_time = Self::parse_time_string(&start)?;
             let end_time = Self::parse_time_string(&end)?;
-            ranges.push(SessionRange {
-                start: start_time,
-                end: end_time,
-                session,
-            });
+            ranges.push((start_time, end_time, session));
         }
-        if let MarketConfig::China(ref mut c) = self.market_config {
-            c.sessions = ranges;
-            self.market_model = self.market_config.create_model();
-        }
+        self.market_manager.set_market_sessions(ranges);
         Ok(())
     }
 
@@ -430,7 +321,7 @@ impl Engine {
     /// :type instrument: Instrument
     fn add_instrument(&mut self, instrument: Instrument) {
         self.instruments
-            .insert(instrument.symbol.clone(), instrument);
+            .insert(instrument.symbol().to_string(), instrument);
     }
 
     /// 设置初始资金
@@ -486,10 +377,6 @@ impl Engine {
             return Err(e);
         }
 
-        let mut count = 0;
-        let mut last_timestamp = 0;
-        let mut bar_index = 0;
-
         // Progress Bar Initialization
         let total_events = self.feed.len_hint().unwrap_or(0);
         let pb = if show_progress {
@@ -517,6 +404,7 @@ impl Engine {
         } else {
             None
         };
+        self.progress_bar = pb;
 
         // Record initial equity
         if let Some(_) = self.feed.peek_timestamp() {
@@ -525,494 +413,31 @@ impl Engine {
                 .calculate_equity(&self.last_prices, &self.instruments);
         }
 
-        let is_live = self.feed.is_live();
+        // Initialize Pipeline
+        let mut pipeline = PipelineRunner::new();
+        pipeline.add_processor(Box::new(ChannelProcessor));
+        pipeline.add_processor(Box::new(DataProcessor));
+        pipeline.add_processor(Box::new(StrategyProcessor));
+        pipeline.add_processor(Box::new(ExecutionProcessor));
+        pipeline.add_processor(Box::new(StatisticsProcessor));
+        pipeline.add_processor(Box::new(CleanupProcessor));
 
-        loop {
-            // -----------------------------------------------------------
-            // 0. Process Channel Events (High Priority)
-            // -----------------------------------------------------------
-            let mut trades_to_process = Vec::new();
-            while let Some(event) = self.event_manager.try_recv() {
-                match event {
-                    Event::OrderRequest(mut order) => {
-                        // 1. Risk Check
-                        if let Err(err) = self.risk_manager.check_internal(
-                            &order,
-                            &self.portfolio,
-                            &self.instruments,
-                            &self.order_manager.active_orders,
-                            &self.last_prices,
-                        ) {
-                            let err_msg = err.to_string();
-                            let mut handled = false;
-                            // Check for insufficient cash to attempt auto-reduction
-                            if err_msg.contains("Insufficient cash")
-                                && order.side == crate::model::OrderSide::Buy
-                            {
-                                if let Some(instr) = self.instruments.get(&order.symbol) {
-                                    // Get price (Limit or Last)
-                                    let price = if let Some(p) = order.price {
-                                        p
-                                    } else {
-                                        *self
-                                            .last_prices
-                                            .get(&order.symbol)
-                                            .unwrap_or(&Decimal::ZERO)
-                                    };
-
-                                    if price > Decimal::ZERO {
-                                        let multiplier = instr.multiplier;
-                                        let cost_per_unit = price * multiplier * instr.margin_ratio;
-                                        if cost_per_unit > Decimal::ZERO {
-                                            let max_qty_raw = self.portfolio.cash / cost_per_unit;
-                                            // Buffer for commission (e.g. 1%)
-                                            let max_qty_raw =
-                                                max_qty_raw * Decimal::from_f64(0.9999).unwrap();
-
-                                            let lot_size = instr.lot_size;
-                                            let mut new_qty = max_qty_raw.floor();
-                                            if lot_size > Decimal::ZERO {
-                                                new_qty = new_qty - (new_qty % lot_size);
-                                            }
-
-                                            if new_qty > Decimal::ZERO && new_qty < order.quantity {
-                                                order.quantity = new_qty;
-                                                handled = true;
-                                                // Send as Validated (assuming it passes now)
-                                                let _ = self
-                                                    .event_manager
-                                                    .send(Event::OrderValidated(order.clone()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !handled {
-                                // Reject
-                                order.status = OrderStatus::Rejected;
-                                order.reject_reason = err_msg;
-                                if let Some(ts) = self.clock.timestamp() {
-                                    order.updated_at = ts;
-                                }
-                                // Directly process rejection report
-                                let report = Event::ExecutionReport(order, None);
-                                let _ = self.event_manager.send(report);
-                            }
-                        } else {
-                            // Validate -> Send to Execution
-                            let _ = self.event_manager.send(Event::OrderValidated(order));
-                        }
-                    }
-                    Event::OrderValidated(order) => {
-                        // 2. Send to Execution Client
-                        self.execution_model.on_order(order.clone());
-                        // Add to local active (Strategy View)
-                        self.order_manager.add_active_order(order);
-                    }
-                    Event::ExecutionReport(order, trade) => {
-                        // 3. Update Order State
-                        self.order_manager.on_execution_report(order);
-
-                        // 4. Process Trade (if any)
-                        if let Some(t) = trade {
-                            trades_to_process.push(t);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !trades_to_process.is_empty() {
-                self.order_manager.process_trades(
-                    trades_to_process,
-                    &mut self.portfolio,
-                    &self.instruments,
-                    self.market_model.as_ref(),
-                    &self.risk_manager,
-                    &self.history_buffer,
-                    &self.last_prices,
-                );
-            }
-
-            // -----------------------------------------------------------
-            // 1. Time & Data Management
-            // -----------------------------------------------------------
-            let mut next_event_time = self.feed.peek_timestamp();
-            let next_timer_time = self.timers.peek().map(|t| t.timestamp);
-
-            if !is_live && next_event_time.is_none() && next_timer_time.is_none() {
-                break; // No more events (Backtest End)
-            }
-
-            // Live Mode Wait
-            if is_live && next_event_time.is_none() {
-                let timeout = if let Some(timer_ts) = next_timer_time {
-                    let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                    if timer_ts > now {
-                        let diff_ms = (timer_ts - now) / 1_000_000;
-                        if diff_ms > 0 {
-                            Duration::from_millis(std::cmp::min(diff_ms as u64, 1000))
-                        } else {
-                            Duration::ZERO
-                        }
-                    } else {
-                        Duration::ZERO
-                    }
-                } else {
-                    Duration::from_secs(1)
-                };
-
-                if timeout > Duration::ZERO {
-                    let feed = self.feed.clone();
-                    #[allow(deprecated)]
-                    if let Some(ts) = py.allow_threads(move || feed.wait_peek(timeout)) {
-                        next_event_time = Some(ts);
-                    }
-                }
-            }
-
-            // Check timers again after wait
-            if is_live && next_event_time.is_none() {
-                if let Some(timer_ts) = next_timer_time {
-                    let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                    if timer_ts > now {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-
-            let process_timer = match (next_event_time, next_timer_time) {
-                (Some(et), Some(tt)) => tt <= et,
-                (Some(_), None) => false,
-                (None, Some(_)) => true,
-                (None, None) => break,
-            };
-
-            // -----------------------------------------------------------
-            // 2. Process Timer or Data Event
-            // -----------------------------------------------------------
-            if process_timer {
-                // --- TIMER EVENT ---
-                if let Some(timer) = self.timers.pop() {
-                    let local_dt =
-                        Self::local_datetime_from_ns(timer.timestamp, self.timezone_offset);
-                    let session = self.market_model.get_session_status(local_dt.time());
-                    self.clock.update(timer.timestamp, session);
-                    if self.force_session_continuous {
-                        self.clock.session = TradingSession::Continuous;
-                    }
-
-                    // Strategy on_timer
-                    let (new_orders, new_timers, canceled_ids) =
-                        self.call_strategy_timer(strategy, &timer.payload)?;
-
-                    // Handle Strategy Output
-                    for order_id in canceled_ids {
-                        self.execution_model.on_cancel(&order_id);
-                    }
-                    for order in new_orders {
-                        let _ = self.event_manager.send(Event::OrderRequest(order));
-                    }
-                    for t in new_timers {
-                        self.timers.push(t);
-                    }
-                }
-            } else {
-                // --- MARKET DATA EVENT ---
-                let event = self.feed.next().unwrap();
-
-                // Update History
-                if let Event::Bar(ref b) = event {
-                    self.history_buffer.write().unwrap().update(b);
-                }
-
-                count += 1;
-                if let Some(pb) = &pb {
-                    pb.inc(1);
-                }
-
-                // Update Clock & Day Close
-                let timestamp = match &event {
-                    Event::Bar(b) => b.timestamp,
-                    Event::Tick(t) => t.timestamp,
-                    _ => 0,
-                };
-
-                if last_timestamp != 0 && timestamp > last_timestamp {
-                    // Record High-Res Equity Curve
-                    let equity = self
-                        .portfolio
-                        .calculate_equity(&self.last_prices, &self.instruments);
-                    self.equity_curve.push((last_timestamp, equity));
-                    self.cash_curve.push((last_timestamp, self.portfolio.cash));
-
-                    bar_index += 1;
-                }
-
-                let local_dt = Self::local_datetime_from_ns(timestamp, self.timezone_offset);
-                let session = self.market_model.get_session_status(local_dt.time());
-                self.clock.update(timestamp, session);
-                if self.force_session_continuous {
-                    self.clock.session = TradingSession::Continuous;
-                }
-
-                let local_date = local_dt.date_naive();
-                if self.current_date != Some(local_date) {
-                    // Day Close Logic
-                    if self.current_date.is_some() {
-                        // Position Snapshots
-                        let snapshots = self.create_position_snapshots(last_timestamp);
-                        self.snapshots.push((last_timestamp, snapshots));
-
-                        // T+1
-                        self.market_model.on_day_close(
-                            &self.portfolio.positions,
-                            &mut self.portfolio.available_positions,
-                            &self.instruments,
-                        );
-
-                        // Process Option Expiry
-                        self.process_option_expiry(local_date);
-
-                        // Expire Day Orders
-                        // Simplified: Engine handles expiry for now by marking them.
-                        // Ideally ExecutionClient checks time.
-                        let (expired, kept): (Vec<Order>, Vec<Order>) = self
-                            .order_manager
-                            .active_orders
-                            .drain(..)
-                            .partition(|o| o.time_in_force == TimeInForce::Day);
-
-                        for mut o in expired {
-                            o.status = OrderStatus::Expired;
-                            self.order_manager.orders.push(o);
-                        }
-                        self.order_manager.active_orders = kept;
-                    }
-                    self.current_date = Some(local_date);
-                }
-
-                match self.execution_mode {
-                    ExecutionMode::NextOpen
-                    | ExecutionMode::NextAverage
-                    | ExecutionMode::NextHighLowMid => {
-                        // Phase 1: Execution (Match pending orders at Open or Average)
-                        let reports = self.execution_model.on_event(
-                            &event,
-                            &self.instruments,
-                            self.execution_mode,
-                            bar_index,
-                            self.clock.session,
-                        );
-
-                        for report in reports {
-                            let _ = self.event_manager.send(report);
-                        }
-
-                        // Drain Channel (Mini-Loop)
-                        let mut trades_to_process = Vec::new();
-                        while let Some(ev) = self.event_manager.try_recv() {
-                            match ev {
-                                Event::ExecutionReport(o, t) => {
-                                    self.order_manager.on_execution_report(o);
-                                    if let Some(tr) = t {
-                                        trades_to_process.push(tr);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !trades_to_process.is_empty() {
-                            self.order_manager.process_trades(
-                                trades_to_process,
-                                &mut self.portfolio,
-                                &self.instruments,
-                                self.market_model.as_ref(),
-                                &self.risk_manager,
-                                &self.history_buffer,
-                                &self.last_prices,
-                            );
-                        }
-
-                        // Phase 2: Strategy
-                        let (new_orders, new_timers, canceled_ids) =
-                            self.call_strategy(strategy, &event)?;
-
-                        for id in canceled_ids {
-                            self.execution_model.on_cancel(&id);
-                            if let Some(o) =
-                                self.order_manager.active_orders.iter_mut().find(|o| o.id == id)
-                            {
-                                o.status = OrderStatus::Cancelled;
-                            }
-                        }
-                        for order in new_orders {
-                            let _ = self.event_manager.send(Event::OrderRequest(order));
-                        }
-                        for t in new_timers {
-                            self.timers.push(t);
-                        }
-
-                        // Phase 3: Process New Order Requests
-                        let mut trades_to_process = Vec::new();
-                        while let Some(ev) = self.event_manager.try_recv() {
-                            match ev {
-                                Event::OrderRequest(mut o) => {
-                                    if let Err(err) = self.risk_manager.check_internal(
-                                        &o,
-                                        &self.portfolio,
-                                        &self.instruments,
-                                        &self.order_manager.active_orders,
-                                        &self.last_prices,
-                                    ) {
-                                        o.status = OrderStatus::Rejected;
-                                        o.reject_reason = err.to_string();
-                                        if let Some(ts) = self.clock.timestamp() {
-                                            o.updated_at = ts;
-                                        }
-                                        self.order_manager.add_active_order(o);
-                                    } else {
-                                        if o.created_at == 0 {
-                                            if let Some(ts) = self.clock.timestamp() {
-                                                o.created_at = ts;
-                                            }
-                                        }
-                                        let _ = self.event_manager.send(Event::OrderValidated(o));
-                                    }
-                                }
-                                Event::OrderValidated(o) => {
-                                    self.execution_model.on_order(o.clone());
-                                    self.order_manager.add_active_order(o);
-                                }
-                                Event::ExecutionReport(o, t) => {
-                                    self.order_manager.on_execution_report(o);
-                                    if let Some(tr) = t {
-                                        trades_to_process.push(tr);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !trades_to_process.is_empty() {
-                            self.order_manager.process_trades(
-                                trades_to_process,
-                                &mut self.portfolio,
-                                &self.instruments,
-                                self.market_model.as_ref(),
-                                &self.risk_manager,
-                                &self.history_buffer,
-                                &self.last_prices,
-                            );
-                        }
-                    }
-                    ExecutionMode::CurrentClose => {
-                        // Phase 1: Strategy
-                        let (new_orders, new_timers, canceled_ids) =
-                            self.call_strategy(strategy, &event)?;
-
-                        for id in canceled_ids {
-                            self.execution_model.on_cancel(&id);
-                        }
-                        for order in new_orders {
-                            let _ = self.event_manager.send(Event::OrderRequest(order));
-                        }
-                        for t in new_timers {
-                            self.timers.push(t);
-                        }
-
-                        // Drain channel
-                        let mut trades_to_process = Vec::new();
-                        while let Some(ev) = self.event_manager.try_recv() {
-                            match ev {
-                                Event::OrderRequest(mut o) => {
-                                    if let Err(err) = self.risk_manager.check_internal(
-                                        &o,
-                                        &self.portfolio,
-                                        &self.instruments,
-                                        &self.order_manager.active_orders,
-                                        &self.last_prices,
-                                    ) {
-                                        o.status = OrderStatus::Rejected;
-                                        o.reject_reason = err.to_string();
-                                        if let Some(ts) = self.clock.timestamp() {
-                                            o.updated_at = ts;
-                                        }
-                                        let _ = self
-                                            .event_manager
-                                            .send(Event::ExecutionReport(o, None));
-                                    } else {
-                                        if o.created_at == 0 {
-                                            if let Some(ts) = self.clock.timestamp() {
-                                                o.created_at = ts;
-                                            }
-                                        }
-                                        let _ = self.event_manager.send(Event::OrderValidated(o));
-                                    }
-                                }
-                                Event::OrderValidated(o) => {
-                                    self.execution_model.on_order(o.clone());
-                                    self.order_manager.add_active_order(o);
-                                }
-                                Event::ExecutionReport(o, t) => {
-                                    self.order_manager.on_execution_report(o);
-                                    if let Some(tr) = t {
-                                        trades_to_process.push(tr);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !trades_to_process.is_empty() {
-                            self.order_manager.process_trades(
-                                trades_to_process,
-                                &mut self.portfolio,
-                                &self.instruments,
-                                self.market_model.as_ref(),
-                                &self.risk_manager,
-                                &self.history_buffer,
-                                &self.last_prices,
-                            );
-                        }
-
-                        // Phase 2: Execution (Match new orders at Close)
-                        let reports = self.execution_model.on_event(
-                            &event,
-                            &self.instruments,
-                            self.execution_mode,
-                            bar_index,
-                            self.clock.session,
-                        );
-                        for report in reports {
-                            let _ = self.event_manager.send(report);
-                        }
-                    }
-                }
-
-                // Cleanup finished orders
-                self.order_manager.cleanup_finished_orders();
-
-                last_timestamp = timestamp;
-            }
-        }
-
-        // Final Equity
-        if count > 0 {
-            let equity = self
-                .portfolio
-                .calculate_equity(&self.last_prices, &self.instruments);
-
-            self.equity_curve.push((last_timestamp, equity));
+        // Run Pipeline
+        if let Err(e) = pipeline.run(self, py, strategy) {
+            // Clean up pb if error
+            self.progress_bar = None;
+            return Err(e);
         }
 
         // Final cleanup
         self.order_manager.cleanup_finished_orders();
 
-        if let Some(pb) = pb {
+        if let Some(pb) = &self.progress_bar {
             pb.finish_with_message("Backtest completed");
         }
+
+        let count = self.bar_count;
+        self.progress_bar = None;
 
         Ok(format!(
             "Backtest finished. Processed {} events. Total Trades: {}",
@@ -1025,55 +450,22 @@ impl Engine {
     ///
     /// :return: BacktestResult
     fn get_results(&self) -> BacktestResult {
-        let trade_pnl = self
-            .order_manager
-            .trade_tracker
-            .calculate_pnl(Some(self.last_prices.clone()));
-        let closed_trades = self.order_manager.trade_tracker.closed_trades.to_vec();
-
-        // Clone equity curve and append current state (Mark-to-Market)
-        // This ensures that we have the latest equity point even if the run loop was interrupted
-        let mut equity_curve = self.equity_curve.clone();
-        let mut cash_curve = self.cash_curve.clone();
-
-        let mut snapshots = self.snapshots.clone();
-
-        if let Some(now_ns) = self.clock.timestamp() {
-            let equity = self
-                .portfolio
-                .calculate_equity(&self.last_prices, &self.instruments);
-            // Avoid duplicate if timestamp matches last one exactly (unlikely but safe)
-            if equity_curve
-                .last()
-                .map(|(t, _)| *t != now_ns)
-                .unwrap_or(true)
-            {
-                equity_curve.push((now_ns, equity));
-            }
-            if cash_curve.last().map(|(t, _)| *t != now_ns).unwrap_or(true) {
-                cash_curve.push((now_ns, self.portfolio.cash));
-            }
-            if snapshots.last().map(|(t, _)| *t != now_ns).unwrap_or(true) {
-                let snap = self.create_position_snapshots(now_ns);
-                snapshots.push((now_ns, snap));
-            }
-        }
-
-        BacktestResult::calculate(
-            equity_curve,
-            cash_curve,
-            snapshots,
-            trade_pnl,
-            closed_trades,
+        self.statistics_manager.generate_backtest_result(
+            &self.portfolio,
+            &self.instruments,
+            &self.last_prices,
+            &self.order_manager,
             self.initial_capital,
-            self.order_manager.get_all_orders(),
-            self.order_manager.trades.clone(),
+            self.clock.timestamp(),
         )
     }
+}
 
+// Private helper methods
+impl Engine {
     fn create_context(
         &self,
-        active_orders: Vec<Order>,
+        active_orders: Arc<Vec<Order>>,
         step_trades: Vec<Trade>,
     ) -> StrategyContext {
         // Create a temporary context for the strategy to use
@@ -1091,11 +483,8 @@ impl Engine {
             self.risk_manager.config.clone(),
         )
     }
-}
 
-// Private helper methods
-impl Engine {
-    fn datetime_from_ns(timestamp: i64) -> DateTime<Utc> {
+    pub(crate) fn datetime_from_ns(timestamp: i64) -> DateTime<Utc> {
         let secs = timestamp.div_euclid(1_000_000_000);
         let nanos = timestamp.rem_euclid(1_000_000_000) as u32;
         Utc.timestamp_opt(secs, nanos)
@@ -1103,72 +492,9 @@ impl Engine {
             .expect("Invalid timestamp")
     }
 
-    fn local_datetime_from_ns(timestamp: i64, offset_secs: i32) -> DateTime<Utc> {
+    pub(crate) fn local_datetime_from_ns(timestamp: i64, offset_secs: i32) -> DateTime<Utc> {
         let offset_ns = i64::from(offset_secs) * 1_000_000_000;
         Self::datetime_from_ns(timestamp + offset_ns)
-    }
-
-    fn create_position_snapshots(&self, _timestamp: i64) -> Vec<PositionSnapshot> {
-        let account_equity = self
-            .portfolio
-            .calculate_equity(&self.last_prices, &self.instruments);
-        let account_equity_f64 = account_equity.to_f64().unwrap_or(0.0);
-
-        let mut snapshots = Vec::new();
-        for (symbol, &qty) in &self.portfolio.positions {
-            if qty == Decimal::ZERO {
-                continue;
-            }
-
-            let price = self
-                .last_prices
-                .get(symbol)
-                .cloned()
-                .unwrap_or(Decimal::ZERO);
-            let instr = self.instruments.get(symbol);
-            let multiplier = instr.map(|i| i.multiplier).unwrap_or(Decimal::ONE);
-            let margin_ratio = instr.map(|i| i.margin_ratio).unwrap_or(Decimal::ZERO);
-
-            // Convert to f64 for snapshot
-            let qty_f64 = qty.to_f64().unwrap_or(0.0);
-            let price_f64 = price.to_f64().unwrap_or(0.0);
-            // let multiplier_f64 = multiplier.to_f64().unwrap_or(1.0);
-
-            let market_value = qty.abs() * price * multiplier;
-            let market_value_f64 = market_value.to_f64().unwrap_or(0.0);
-
-            let (long_shares, short_shares) = if qty > Decimal::ZERO {
-                (qty_f64, 0.0)
-            } else {
-                (0.0, qty.abs().to_f64().unwrap_or(0.0))
-            };
-
-            let margin_dec = market_value * margin_ratio;
-            let margin_f64 = margin_dec.to_f64().unwrap_or(0.0);
-
-            let unrealized_pnl = self
-                .order_manager
-                .trade_tracker
-                .get_unrealized_pnl(symbol, price, multiplier);
-            let unrealized_pnl_f64 = unrealized_pnl.to_f64().unwrap_or(0.0);
-
-            let entry_price = self.order_manager.trade_tracker.get_average_price(symbol);
-            let entry_price_f64 = entry_price.to_f64().unwrap_or(0.0);
-
-            snapshots.push(PositionSnapshot {
-                symbol: symbol.clone(),
-                quantity: qty_f64,
-                entry_price: entry_price_f64,
-                long_shares,
-                short_shares,
-                close: price_f64,
-                equity: account_equity_f64,
-                market_value: market_value_f64,
-                margin: margin_f64,
-                unrealized_pnl: unrealized_pnl_f64,
-            });
-        }
-        snapshots
     }
 
     fn parse_time_string(value: &str) -> PyResult<NaiveTime> {
@@ -1184,7 +510,7 @@ impl Engine {
         )))
     }
 
-    fn call_strategy(
+    pub(crate) fn call_strategy(
         &mut self,
         strategy: &Bound<'_, PyAny>,
         event: &Event,
@@ -1194,7 +520,9 @@ impl Engine {
             Event::Bar(b) => {
                 self.last_prices.insert(b.symbol.clone(), b.close);
                 let step_trades = std::mem::take(&mut self.order_manager.current_step_trades);
-                let ctx = self.create_context(self.order_manager.active_orders.clone(), step_trades);
+                // Share active orders via Arc
+                let active_orders = Arc::new(self.order_manager.active_orders.clone());
+                let ctx = self.create_context(active_orders, step_trades);
                 let py_ctx = Python::attach(|py| {
                     let py_ctx = Py::new(py, ctx).unwrap();
                     let args = (b.clone(), py_ctx.clone_ref(py));
@@ -1208,16 +536,24 @@ impl Engine {
                 let mut canceled_ids = Vec::new();
                 Python::attach(|py| {
                     let ctx_ref = py_ctx.borrow(py);
-                    new_orders.extend(ctx_ref.orders.clone());
-                    new_timers.extend(ctx_ref.timers.clone());
-                    canceled_ids.extend(ctx_ref.canceled_order_ids.clone());
+                    // Read from RwLock
+                    if let Ok(orders) = ctx_ref.orders_arc.read() {
+                        new_orders.extend(orders.clone());
+                    }
+                    if let Ok(timers) = ctx_ref.timers_arc.read() {
+                        new_timers.extend(timers.clone());
+                    }
+                    if let Ok(canceled) = ctx_ref.canceled_order_ids_arc.read() {
+                        canceled_ids.extend(canceled.clone());
+                    }
                 });
                 Ok((new_orders, new_timers, canceled_ids))
             }
             Event::Tick(t) => {
                 self.last_prices.insert(t.symbol.clone(), t.price);
                 let step_trades = std::mem::take(&mut self.order_manager.current_step_trades);
-                let ctx = self.create_context(self.order_manager.active_orders.clone(), step_trades);
+                let active_orders = Arc::new(self.order_manager.active_orders.clone());
+                let ctx = self.create_context(active_orders, step_trades);
                 let py_ctx = Python::attach(|py| {
                     let py_ctx = Py::new(py, ctx).unwrap();
                     let args = (t.clone(), py_ctx.clone_ref(py));
@@ -1231,9 +567,43 @@ impl Engine {
                 let mut canceled_ids = Vec::new();
                 Python::attach(|py| {
                     let ctx_ref = py_ctx.borrow(py);
-                    new_orders.extend(ctx_ref.orders.clone());
-                    new_timers.extend(ctx_ref.timers.clone());
-                    canceled_ids.extend(ctx_ref.canceled_order_ids.clone());
+                    if let Ok(orders) = ctx_ref.orders_arc.read() {
+                        new_orders.extend(orders.clone());
+                    }
+                    if let Ok(timers) = ctx_ref.timers_arc.read() {
+                        new_timers.extend(timers.clone());
+                    }
+                    if let Ok(canceled) = ctx_ref.canceled_order_ids_arc.read() {
+                        canceled_ids.extend(canceled.clone());
+                    }
+                });
+                Ok((new_orders, new_timers, canceled_ids))
+            }
+            Event::Timer(timer) => {
+                let step_trades = std::mem::take(&mut self.order_manager.current_step_trades);
+                let active_orders = Arc::new(self.order_manager.active_orders.clone());
+                let ctx = self.create_context(active_orders, step_trades);
+                let py_ctx = Python::attach(|py| {
+                    let py_ctx = Py::new(py, ctx).unwrap();
+                    strategy.call_method1("_on_timer_event", (timer.payload.as_str(), py_ctx.clone_ref(py)))?;
+                    Ok::<_, PyErr>(py_ctx)
+                })?;
+
+                // Extract orders and timers
+                let mut new_orders = Vec::new();
+                let mut new_timers = Vec::new();
+                let mut canceled_ids = Vec::new();
+                Python::attach(|py| {
+                    let ctx_ref = py_ctx.borrow(py);
+                    if let Ok(orders) = ctx_ref.orders_arc.read() {
+                        new_orders.extend(orders.clone());
+                    }
+                    if let Ok(timers) = ctx_ref.timers_arc.read() {
+                        new_timers.extend(timers.clone());
+                    }
+                    if let Ok(canceled) = ctx_ref.canceled_order_ids_arc.read() {
+                        canceled_ids.extend(canceled.clone());
+                    }
                 });
                 Ok((new_orders, new_timers, canceled_ids))
             }
@@ -1243,32 +613,6 @@ impl Engine {
         }
     }
 
-    fn call_strategy_timer(
-        &mut self,
-        strategy: &Bound<'_, PyAny>,
-        payload: &str,
-    ) -> PyResult<(Vec<Order>, Vec<Timer>, Vec<String>)> {
-        let step_trades = std::mem::take(&mut self.order_manager.current_step_trades);
-        let ctx = self.create_context(self.order_manager.active_orders.clone(), step_trades);
-        let py_ctx = Python::attach(|py| {
-            let py_ctx = Py::new(py, ctx).unwrap();
-            // Call _on_timer_event in Python
-            strategy.call_method1("_on_timer_event", (payload, py_ctx.clone_ref(py)))?;
-            Ok::<_, PyErr>(py_ctx)
-        })?;
-
-        // Extract orders and timers (Timers can schedule new timers or place orders!)
-        let mut new_orders = Vec::new();
-        let mut new_timers = Vec::new();
-        let mut canceled_ids = Vec::new();
-        Python::attach(|py| {
-            let ctx_ref = py_ctx.borrow(py);
-            new_orders.extend(ctx_ref.orders.clone());
-            new_timers.extend(ctx_ref.timers.clone());
-            canceled_ids.extend(ctx_ref.canceled_order_ids.clone());
-        });
-        Ok((new_orders, new_timers, canceled_ids))
-    }
 }
 
 #[cfg(test)]
@@ -1294,19 +638,16 @@ mod tests {
 
     #[test]
     fn test_engine_add_instrument() {
+        use crate::model::instrument::{InstrumentEnum, StockInstrument};
+
         let mut engine = Engine::new();
         let instr = Instrument {
-            symbol: "AAPL".to_string(),
             asset_type: AssetType::Stock,
-            multiplier: Decimal::ONE,
-            margin_ratio: Decimal::ONE,
-            tick_size: Decimal::new(1, 2),
-            option_type: None,
-            strike_price: None,
-            expiry_date: None,
-            lot_size: Decimal::from(100),
-            underlying_symbol: None,
-            settlement_type: None,
+            inner: InstrumentEnum::Stock(StockInstrument {
+                symbol: "AAPL".to_string(),
+                lot_size: Decimal::from(100),
+                tick_size: Decimal::new(1, 2),
+            }),
         };
         engine.add_instrument(instr);
         assert!(engine.instruments.contains_key("AAPL"));

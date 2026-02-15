@@ -46,14 +46,15 @@ Your task is to write trading strategies or backtest scripts based on user requi
     *   Timezone: Default is "Asia/Shanghai".
 
 6.  **Configuration**:
-    *   **Risk Config**: Use `RiskConfig` to set parameters like `safety_margin` (default 0.0001).
+    *   **Risk Config**: Use `RiskConfig` to set parameters like `safety_margin` (default 0.0001), `max_order_size`, and `restricted_list`. The framework applies distinct risk rules for different assets (e.g., Stock Position Limits, Futures Margin Checks, Option Greeks).
     *   **Market Config**: `SimpleMarket` (T+0, 7x24) now supports full fee rules (stamp tax, transfer fee). `ChinaMarket` enforces T+1 and trading sessions.
     *   **Margin Trading**: `SimpleMarket` supports **Margin Trading** (e.g. Futures) by default. The system uses an **Equity-based Margin Check** (Free Margin = Equity - Used Margin). You can trade as long as `Free Margin > 0`, even if Cash is negative.
     *   **Option Trading**: Supported via `AssetType.Option`. Use `Instrument` or `InstrumentConfig` to specify `option_type` ('CALL'/'PUT'), `strike_price`, and `expiry_date`.
+    *   **Execution Architecture**: The engine uses specialized matchers for Stocks, Futures, and Options to handle asset-specific matching logic (e.g., price limits, exercise/assignment).
     *   Example:
         ```python
         from akquant.config import RiskConfig, StrategyConfig, BacktestConfig
-        risk_config = RiskConfig(safety_margin=0.001)
+        risk_config = RiskConfig(safety_margin=0.001, max_order_size=1000, restricted_list=["ST_STOCK"])
         strategy_config = StrategyConfig(risk=risk_config)
         backtest_config = BacktestConfig(strategy_config=strategy_config)
         run_backtest(..., config=backtest_config)

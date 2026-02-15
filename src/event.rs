@@ -1,9 +1,10 @@
-use crate::model::{Bar, Order, Tick, Trade};
+use crate::model::{Bar, Order, Tick, Timer, Trade};
 
 #[derive(Debug, Clone)]
 pub enum Event {
     Bar(Bar),
     Tick(Tick),
+    Timer(Timer),
     /// 策略发出的订单请求
     OrderRequest(Order),
     /// 风控通过的订单 (准备执行)
