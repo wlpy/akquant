@@ -450,36 +450,7 @@ impl Engine {
         }
 
         // Initialize Pipeline
-        let mut pipeline = PipelineRunner::new();
-        // 1. Process events from previous iteration (or init)
-        pipeline.add_processor(Box::new(ChannelProcessor));
-
-        // 2. Fetch new Data Event
-        pipeline.add_processor(Box::new(DataProcessor::new()));
-
-        // 3. Pre-Strategy Execution (Match Pending Orders)
-        // For NextOpen/NextAverage: Matches orders generated in previous bar against current bar.
-        pipeline.add_processor(Box::new(ExecutionProcessor::new(ExecutionPhase::PreStrategy)));
-
-        // 4. Process Fills from Pre-Execution immediately (Update Portfolio before Strategy)
-        pipeline.add_processor(Box::new(ChannelProcessor));
-
-        // 5. Run Strategy
-        pipeline.add_processor(Box::new(StrategyProcessor));
-
-        // 6. Process Order Requests from Strategy immediately (Validate -> Pending)
-        pipeline.add_processor(Box::new(ChannelProcessor));
-
-        // 7. Post-Strategy Execution
-        // For CurrentClose: Matches orders generated in current bar against current bar.
-        pipeline.add_processor(Box::new(ExecutionProcessor::new(ExecutionPhase::PostStrategy)));
-
-        // 8. Process Fills from Post-Execution
-        pipeline.add_processor(Box::new(ChannelProcessor));
-
-        // 9. Statistics & Cleanup
-        pipeline.add_processor(Box::new(StatisticsProcessor));
-        pipeline.add_processor(Box::new(CleanupProcessor));
+        let mut pipeline = self.build_pipeline();
 
         // Run Pipeline
         if let Err(e) = pipeline.run(self, py, strategy) {
@@ -683,6 +654,41 @@ impl Engine {
                 Ok((Vec::new(), Vec::new(), Vec::new()))
             }
         }
+    }
+
+    fn build_pipeline(&self) -> PipelineRunner {
+        let mut pipeline = PipelineRunner::new();
+        // 1. Process events from previous iteration (or init)
+        pipeline.add_processor(Box::new(ChannelProcessor));
+
+        // 2. Fetch new Data Event
+        pipeline.add_processor(Box::new(DataProcessor::new()));
+
+        // 3. Pre-Strategy Execution (Match Pending Orders)
+        // For NextOpen/NextAverage: Matches orders generated in previous bar against current bar.
+        pipeline.add_processor(Box::new(ExecutionProcessor::new(ExecutionPhase::PreStrategy)));
+
+        // 4. Process Fills from Pre-Execution immediately (Update Portfolio before Strategy)
+        pipeline.add_processor(Box::new(ChannelProcessor));
+
+        // 5. Run Strategy
+        pipeline.add_processor(Box::new(StrategyProcessor));
+
+        // 6. Process Order Requests from Strategy immediately (Validate -> Pending)
+        pipeline.add_processor(Box::new(ChannelProcessor));
+
+        // 7. Post-Strategy Execution
+        // For CurrentClose: Matches orders generated in current bar against current bar.
+        pipeline.add_processor(Box::new(ExecutionProcessor::new(ExecutionPhase::PostStrategy)));
+
+        // 8. Process Fills from Post-Execution
+        pipeline.add_processor(Box::new(ChannelProcessor));
+
+        // 9. Statistics & Cleanup
+        pipeline.add_processor(Box::new(StatisticsProcessor));
+        pipeline.add_processor(Box::new(CleanupProcessor));
+
+        pipeline
     }
 
 }

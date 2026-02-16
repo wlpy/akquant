@@ -32,6 +32,6 @@ rust_decimal_macros = "1.40"
 log = "0.4"
 
 [features]
-default = ["extension-module"]
+default = []
 extension-module = ["pyo3/extension-module"]
 test-utils = ["pyo3/auto-initialize"]
