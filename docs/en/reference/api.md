@@ -13,22 +13,78 @@ def run_backtest(
     data: Optional[Union[pd.DataFrame, Dict[str, pd.DataFrame], List[Bar]]] = None,
     strategy: Union[Type[Strategy], Strategy, Callable[[Any, Bar], None], None] = None,
     symbol: Union[str, List[str]] = "BENCHMARK",
-    cash: float = 1_000_000.0,
-    commission: float = 0.0003,
-    instruments_config: Optional[Union[List[InstrumentConfig], Dict[str, InstrumentConfig]]] = None,
-    instruments: Optional[List[Instrument]] = None,
+    initial_cash: Optional[float] = None,
+    commission_rate: Optional[float] = None,
+    stamp_tax_rate: float = 0.0,
+    transfer_fee_rate: float = 0.0,
+    min_commission: float = 0.0,
+    execution_mode: Union[ExecutionMode, str] = ExecutionMode.NextOpen,
+    timezone: Optional[str] = None,
+    t_plus_one: bool = False,
+    initialize: Optional[Callable[[Any], None]] = None,
+    context: Optional[Dict[str, Any]] = None,
+    history_depth: Optional[int] = None,
     warmup_period: int = 0,
-    # ... other parameters
+    lot_size: Union[int, Dict[str, int], None] = None,
+    show_progress: Optional[bool] = None,
+    start_time: Optional[Union[str, Any]] = None,
+    end_time: Optional[Union[str, Any]] = None,
+    config: Optional[BacktestConfig] = None,
+    instruments_config: Optional[Union[List[InstrumentConfig], Dict[str, InstrumentConfig]]] = None,
+    custom_matchers: Optional[Dict[AssetType, Any]] = None,
+    **kwargs: Any,
 ) -> BacktestResult
 ```
 
 **Key Parameters:**
 
 *   `data`: Backtest data. Supports a single DataFrame, or a `{symbol: DataFrame}` dictionary.
-*   `warmup_period`: **(New)** Strategy warmup period. Specifies the length of historical data (number of Bars) to preload for indicator calculation.
-*   `instruments_config`: **(New)** Instrument configuration. Used to set parameters for non-stock assets like futures/options (e.g., multiplier, margin ratio).
+*   `strategy`: Strategy class or instance. Also supports passing an `on_bar` function (functional style).
+*   `symbol`: Symbol or list of symbols.
+*   `initial_cash`: Initial cash (default 1,000,000.0).
+*   `execution_mode`: Execution mode.
+    *   `ExecutionMode.NextOpen`: Match at next Bar Open (Default).
+    *   `ExecutionMode.CurrentClose`: Match at current Bar Close.
+*   `t_plus_one`: Enable T+1 trading rule (Default False). If enabled, it forces usage of China Market Model.
+*   `warmup_period`: Strategy warmup period. Specifies the length of historical data (number of Bars) to preload for indicator calculation.
+*   `start_time` / `end_time`: Backtest start/end time.
+*   `config`: `BacktestConfig` object for centralized configuration.
+*   `instruments_config`: Instrument configuration. Used to set parameters for non-stock assets like futures/options (e.g., multiplier, margin ratio).
     *   Accepts `List[InstrumentConfig]` or `{symbol: InstrumentConfig}`.
-*   `instruments`: **(New)** Explicit list of `Instrument` objects. Use this for advanced configuration (e.g., Options with specific strike/expiry/settlement) where `InstrumentConfig` is insufficient.
+
+### `akquant.BacktestConfig`
+
+Data class for centralized backtest configuration.
+
+```python
+@dataclass
+class BacktestConfig:
+    strategy_config: StrategyConfig
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    instruments: Optional[List[str]] = None
+    instruments_config: Optional[Union[List[InstrumentConfig], Dict[str, InstrumentConfig]]] = None
+    benchmark: Optional[str] = None
+    timezone: str = "Asia/Shanghai"
+    show_progress: bool = True
+    history_depth: int = 0
+```
+
+### `akquant.StrategyConfig`
+
+Configuration at the strategy level, including capital, fees, and risk.
+
+```python
+@dataclass
+class StrategyConfig:
+    initial_cash: float = 100000.0
+    commission_rate: float = 0.0
+    stamp_tax_rate: float = 0.0
+    transfer_fee_rate: float = 0.0
+    min_commission: float = 0.0
+    enable_fractional_shares: bool = False
+    risk: Optional[RiskConfig] = None
+```
 
 ### `akquant.InstrumentConfig`
 
@@ -49,64 +105,6 @@ class InstrumentConfig:
     expiry_date: Optional[str] = None  # YYYY-MM-DD
 ```
 
-## 2. Core Engine
-
-### `akquant.Engine`
-
-The main entry point for the backtesting engine.
-
-```python
-engine = akquant.Engine()
-```
-
-**Configuration Methods:**
-
-*   `set_timezone(offset: int)`: Set timezone offset (seconds). E.g., 28800 for UTC+8.
-*   `use_simulated_execution()`: (Default) Enable in-memory matching simulation execution.
-*   `use_realtime_execution()`: Enable real-time/paper trading execution (orders sent to external Broker).
-*   `set_execution_mode(mode: ExecutionMode)`: Set matching mode.
-    *   `ExecutionMode.NextOpen`: Match at next Bar Open (Default).
-    *   `ExecutionMode.CurrentClose`: Match at current Bar Close.
-*   `set_history_depth(depth: int)`: Set the history data cache length at the engine level.
-
-**Market & Fee Configuration:**
-
-*   `use_simple_market(commission_rate: float)`: Enable simple market (T+0, 7x24).
-    *   **Update**: Now supports stamp tax, transfer fee, and min commission configuration (via `set_stock_fee_rules`).
-*   `use_china_market()`: Enable China market (T+1/T+0, trading sessions, taxes).
-*   `use_china_futures_market()`: Enable China futures market (T+0, manual session config required).
-*   `set_t_plus_one(enabled: bool)`: Enable/Disable T+1 rule (ChinaMarket only).
-*   `set_stock_fee_rules(commission_rate, stamp_tax, transfer_fee, min_commission)`: Set stock fee rules (Applicable to both SimpleMarket and ChinaMarket).
-*   `set_slippage(type: str, value: float)`: Set slippage. `type` can be `"fixed"` (fixed amount) or `"percent"` (percentage).
-
-**Runtime Methods:**
-
-*   `add_instrument(instrument: Instrument)`: Add instrument definition.
-*   `add_data(feed: DataFeed)`: Add data source.
-*   `add_bars(bars: List[Bar])`: Batch add Bar data.
-*   `run(strategy: Strategy, show_progress: bool) -> str`: Run backtest.
-*   `get_results() -> BacktestResult`: Get detailed backtest results.
-
-### `akquant.DataFeed`
-
-Data container.
-
-*   `add_bars(bars: List[Bar])`: Add data.
-*   `sort()`: Sort data by timestamp.
-
-### `akquant.BarAggregator`
-
-Real-time Tick aggregator, used to convert Tick streams into Bar data and automatically inject into DataFeed.
-
-```python
-aggregator = akquant.BarAggregator(feed: DataFeed, interval_min: int = 1)
-```
-
-**Methods:**
-
-*   `on_tick(symbol: str, price: float, volume: float, timestamp_ns: int)`: Process new Tick data.
-    *   `volume`: Here volume should be accumulated volume (TotalVolume), the aggregator will automatically calculate the increment.
-
 ## 2. Strategy Development (Strategy)
 
 ### `akquant.Strategy`
@@ -119,6 +117,15 @@ Strategy base class. Users should inherit from this class and override callback 
 *   `on_bar(bar: Bar)`: Triggered when a Bar closes.
 *   `on_tick(tick: Tick)`: Triggered when a Tick arrives.
 *   `on_timer(payload: str)`: Triggered by timer.
+*   `on_stop()`: Triggered when the strategy stops.
+*   `on_train_signal(context)`: Triggered by rolling training signal (ML mode).
+
+**Properties & Shortcuts:**
+
+*   `self.symbol`: The symbol currently being processed.
+*   `self.close`, `self.open`, `self.high`, `self.low`, `self.volume`: Current Bar/Tick price and volume.
+*   `self.position`: Position object for current symbol, with `size` and `available` properties.
+*   `self.now`: Current backtest time (`pd.Timestamp`).
 
 **Trading Methods:**
 
@@ -126,19 +133,33 @@ Strategy base class. Users should inherit from this class and override callback 
 *   `sell(symbol, quantity, price=None, ...)`: Sell.
 *   `short(symbol, quantity, price=None, ...)`: Short sell.
 *   `cover(symbol, quantity, price=None, ...)`: Buy to cover.
-*   `stop_buy(symbol, trigger_price, quantity, ...)`: Stop buy.
-*   `stop_sell(symbol, trigger_price, quantity, ...)`: Stop sell.
+*   `stop_buy(symbol, trigger_price, quantity, ...)`: Stop buy (Stop Market). Triggers a market buy order when price breaks above `trigger_price`.
+*   `stop_sell(symbol, trigger_price, quantity, ...)`: Stop sell (Stop Market). Triggers a market sell order when price drops below `trigger_price`.
 *   `order_target_value(target_value, symbol, price=None)`: Adjust position to target value.
 *   `order_target_percent(target_percent, symbol, price=None)`: Adjust position to target account percentage.
 *   `close_position(symbol)`: Close position for a specific instrument.
-*   `cancel_all_orders(symbol)`: Cancel all pending orders for a specific instrument.
+*   `cancel_order(order_id: str)`: Cancel a specific order.
+*   `cancel_all_orders(symbol)`: Cancel all pending orders for a specific instrument. If `symbol` is omitted, cancels all orders.
 
-**Data Access:**
+**Data & Utilities:**
 
 *   `get_history(count, symbol, field="close") -> np.ndarray`: Get history data array (Zero-Copy).
+*   `get_history_df(count, symbol) -> pd.DataFrame`: Get history data DataFrame (OHLCV).
 *   `get_position(symbol) -> float`: Get current position size.
 *   `get_cash() -> float`: Get current available cash.
-*   `subscribe(instrument_id: str)`: Subscribe to market data.
+*   `get_account() -> Dict[str, float]`: Get account snapshot. Includes `cash` (available), `equity` (total equity), `market_value` (position value), plus `frozen_cash` and `margin` (reserved fields, currently 0).
+*   `get_order(order_id) -> Order`: Get details of a specific order.
+*   `get_open_orders(symbol) -> List[Order]`: Get list of open orders.
+*   `subscribe(instrument_id: str)`: Subscribe to market data. Must be called explicitly for multi-asset backtesting or live trading to receive `on_tick`/`on_bar` callbacks.
+*   `log(msg: str, level: int)`: Log with timestamp.
+*   `schedule(trigger_time, payload)`: Register a one-time timer task.
+*   `add_daily_timer(time_str, payload)`: Register a daily timer task.
+
+**Machine Learning Support:**
+
+*   `set_rolling_window(train_window, step)`: Set rolling training window.
+*   `get_rolling_data(length, symbol)`: Get rolling training data (X, y).
+*   `prepare_features(df, mode)`: (Override required) Feature engineering and label generation.
 
 ### `akquant.Bar`
 
@@ -148,19 +169,35 @@ Bar data object.
 *   `open`, `high`, `low`, `close`, `volume`: OHLCV data.
 *   `symbol`: Instrument symbol.
 
-## 3. Trading Objects
+## 3. Core Engine
+
+### `akquant.Engine`
+
+The main entry point for the backtesting engine (usually used implicitly via `run_backtest`).
+
+**Configuration Methods:**
+
+*   `set_timezone(offset: int)`: Set timezone offset.
+*   `use_simulated_execution()` / `use_realtime_execution()`: Set execution environment.
+*   `set_execution_mode(mode)`: Set matching mode.
+*   `set_history_depth(depth)`: Set history data cache length.
+
+**Market & Fee Configuration:**
+
+*   `use_simple_market()`: Enable simple market.
+*   `use_china_market()`: Enable China market.
+*   `set_stock_fee_rules(commission, stamp_tax, transfer_fee, min_commission)`: Set fee rules.
+
+## 4. Trading Objects
 
 ### `akquant.Order`
 
-Order object.
-
 *   `id`: Order ID.
 *   `symbol`: Instrument symbol.
-*   `side`: `OrderSide.Buy` or `OrderSide.Sell`.
-*   `order_type`: `OrderType.Market`, `OrderType.Limit`, `OrderType.StopMarket` etc.
-*   `status`: `OrderStatus.New`, `Submitted`, `Filled`, `Cancelled`, `Rejected` etc.
-*   `quantity`: Order quantity.
-*   `filled_quantity`: Filled quantity.
+*   `side`: `OrderSide.Buy` / `OrderSide.Sell`.
+*   `order_type`: `OrderType.Market` / `OrderType.Limit` etc.
+*   `status`: `OrderStatus.New` / `Filled` / `Cancelled` etc.
+*   `quantity` / `filled_quantity`: Order / Filled quantity.
 *   `average_filled_price`: Average filled price.
 
 ### `akquant.Instrument`
@@ -174,71 +211,40 @@ Instrument(
     multiplier=1.0,
     margin_ratio=1.0,
     tick_size=0.01,
-    # Option specific
-    option_type=None,        # OptionType.Call / OptionType.Put
-    strike_price=None,       # float
-    expiry_date=None,        # int (ns timestamp)
-    underlying_symbol=None,  # str
-    settlement_type=None     # SettlementType.Physical / SettlementType.Cash
+    option_type=None,
+    strike_price=None,
+    expiry_date=None
 )
 ```
 
-## 4. Portfolio & Risk
-
-### `akquant.Portfolio`
-
-*   `cash`: Current cash.
-*   `positions`: Position dictionary `{symbol: quantity}`.
-*   `available_positions`: Available positions (considering T+1 and frozen).
+## 5. Portfolio & Risk
 
 ### `akquant.RiskConfig`
 
 Risk configuration.
 
-*   `active`: Whether enabled.
-*   `max_order_size`: Max single order size.
-*   `max_order_value`: Max single order value.
-*   `max_position_size`: Max position size.
-*   `restricted_list`: Restricted trading list (List[str]).
+```python
+@dataclass
+class RiskConfig:
+    active: bool = True
+    safety_margin: float = 0.0001
+    max_order_size: Optional[float] = None
+    max_order_value: Optional[float] = None
+    max_position_size: Optional[float] = None
+    restricted_list: Optional[List[str]] = None
+```
 
-## 5. Analysis
+## 6. Analysis
 
 ### `akquant.BacktestResult`
 
-Backtest result container.
+Backtest result object.
 
-*   `metrics_df`: (pd.DataFrame) DataFrame containing performance metrics (Total Return, Sharpe, Max Drawdown, Ulcer Index, UPI, **SQN**, **Kelly**, **VaR/CVaR**, etc.).
-*   `trades_df`: (pd.DataFrame) DataFrame containing all closed trades.
-*   `orders_df`: (pd.DataFrame) DataFrame containing all order records.
-*   `positions_df`: (pd.DataFrame) DataFrame containing daily position details, including quantity, market value, unrealized PnL, **average entry price (entry_price)**, etc.
-*   `equity_curve`: (pd.Series) Equity curve, indexed by time, values are total account equity.
-*   `cash_curve`: (pd.Series) Cash curve, indexed by time, values are available cash.
-*   `trades`: (List[ClosedTrade]) Raw list of closed trade objects.
+**Properties:**
 
-## 6. Built-in Indicators
-
-Located in `akquant.indicators` module.
-
-*   `SMA(period)`
-*   `EMA(period)`
-*   `MACD(fast, slow, signal)`
-*   `RSI(period)`
-*   `BollingerBands(period, multiplier)`
-*   `ATR(period)`
-
-All indicators have a `value` property to get the current value, and will automatically update after being registered to a Strategy.
-
-## 7. Machine Learning
-
-AKQuant provides a dedicated machine learning support module `akquant.ml`. For detailed usage, please refer to the [Machine Learning Guide](ml_guide.md).
-
-### Core Classes
-
-*   `akquant.ml.QuantModel`: Unified interface for all ML models.
-*   `akquant.ml.SklearnAdapter`: Adapter for Scikit-learn style models (e.g., XGBoost, LightGBM).
-*   `akquant.ml.PyTorchAdapter`: Adapter for PyTorch deep learning models.
-
-Key Methods:
-
-*   `set_validation(method='walk_forward', verbose=False, ...)`: Configure rolling validation/training parameters.
-*   `predict(X)`: Execute prediction.
+*   `metrics_df`: Performance metrics DataFrame.
+*   `trades_df`: Trade history DataFrame.
+*   `orders_df`: Order history DataFrame.
+*   `positions_df`: Daily position details.
+*   `equity_curve`: Equity curve.
+*   `cash_curve`: Cash curve.
