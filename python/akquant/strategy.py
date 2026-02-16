@@ -866,7 +866,7 @@ class Strategy:
             raise RuntimeError("Context not ready")
         return self.ctx.positions
 
-    def get_open_orders(self, symbol: Optional[str] = None) -> list[Any]:
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[Any]:
         """
         获取当前未完成的订单.
 
@@ -888,7 +888,62 @@ class Strategy:
             return [o for o in orders if o.symbol == symbol]
         return orders
 
-    def get_trades(self) -> list[Any]:
+    def get_order(self, order_id: str) -> Optional[Any]:
+        """
+        获取指定订单详情.
+
+        Args:
+            order_id: 订单 ID
+
+        Returns:
+            Order: 订单对象，如果未找到则返回 None
+        """
+        # 首先在已知订单缓存中查找
+        if order_id in self._known_orders:
+            return self._known_orders[order_id]
+
+        # 如果缓存中没有（可能是初始化前的历史订单），
+        # 尝试从 ctx.orders 中查找（效率较低）
+        if self.ctx:
+            # 检查活跃订单
+            for o in self.ctx.active_orders:
+                if o.id == order_id:
+                    return o
+            # 检查当前 tick/bar 完成的订单
+            # 注意：Rust context.orders 通常只包含新生成的订单，不包含所有历史
+            # 这里我们主要依赖 _known_orders 缓存
+            pass
+
+        return None
+
+    def get_account(self) -> Dict[str, float]:
+        """
+        获取账户资金详情快照.
+
+        Returns:
+            Dict: 包含以下字段:
+                - cash: 可用资金
+                - equity: 总权益 (现金 + 持仓市值)
+                - market_value: 持仓总市值 (equity - cash)
+                - frozen_cash: (预留) 冻结资金, 暂为 0.0
+                - margin: (预留) 占用保证金, 暂为 0.0
+        """
+        if self.ctx is None:
+            raise RuntimeError("Context not ready")
+
+        cash = self.ctx.cash
+        equity = self.equity
+        market_value = equity - cash
+
+        return {
+            "cash": cash,
+            "equity": equity,
+            "market_value": market_value,
+            "frozen_cash": 0.0,  # Placeholder for future implementation
+            "margin": 0.0,  # Placeholder for future implementation
+        }
+
+    def get_trades(self) -> List[Any]:
         """
         获取所有历史成交记录 (Closed Trades).
 
