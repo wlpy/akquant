@@ -10,6 +10,7 @@ pub struct SymbolHistory {
     pub lows: VecDeque<f64>,
     pub closes: VecDeque<f64>,
     pub volumes: VecDeque<f64>,
+    pub extras: HashMap<String, VecDeque<f64>>,
     pub capacity: usize,
 }
 
@@ -22,30 +23,45 @@ impl SymbolHistory {
             lows: VecDeque::with_capacity(capacity),
             closes: VecDeque::with_capacity(capacity),
             volumes: VecDeque::with_capacity(capacity),
+            extras: HashMap::new(),
             capacity,
         }
     }
 
     pub fn push(&mut self, bar: &Bar) {
         if self.capacity == 0 {
-            // If capacity is 0, we can still store unbounded history?
-            // Or should we interpret 0 as "unlimited" or "none"?
-            // Usually 0 means None.
-            // But if we want MAE/MFE, we need history.
-            // Let's assume 0 means disabled.
             return;
         }
 
         if self.timestamps.len() >= self.capacity {
-            // O(1) removal from front
             self.timestamps.pop_front();
             self.opens.pop_front();
             self.highs.pop_front();
             self.lows.pop_front();
             self.closes.pop_front();
             self.volumes.pop_front();
+            for v in self.extras.values_mut() {
+                v.pop_front();
+            }
         }
 
+        let cur_len = self.timestamps.len();
+        for (k, _) in bar.extra.iter() {
+            if !self.extras.contains_key(k) {
+                let mut dq = VecDeque::with_capacity(self.capacity);
+                for _ in 0..cur_len {
+                    dq.push_back(f64::NAN);
+                }
+                self.extras.insert(k.clone(), dq);
+            }
+        }
+        let keys: Vec<String> = self.extras.keys().cloned().collect();
+        for k in keys {
+            let val = bar.extra.get(&k).cloned().unwrap_or(f64::NAN);
+            if let Some(dq) = self.extras.get_mut(&k) {
+                dq.push_back(val);
+            }
+        }
         self.timestamps.push_back(bar.timestamp);
         self.opens.push_back(bar.open.to_f64().unwrap_or(0.0));
         self.highs.push_back(bar.high.to_f64().unwrap_or(0.0));
@@ -71,7 +87,6 @@ impl HistoryBuffer {
 
     pub fn set_capacity(&mut self, capacity: usize) {
         self.default_capacity = capacity;
-        // Clear existing data when capacity changes to avoid complexity
         self.data.clear();
     }
 

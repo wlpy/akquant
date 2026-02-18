@@ -21,6 +21,31 @@
 
 以下是一些常用量化策略的实现代码，可以直接在您的项目中使用。我们为每个策略提供了详细的逻辑说明，帮助您理解其核心思想。
 
+### 使用后复权序列作信号，真实价格撮合
+
+当数据包含 `adj_close` 或 `adj_factor` 时，可直接通过 `get_history(symbol=..., field="adj_close", n)` 获取后复权序列用于信号计算，而撮合与估值仍使用真实收盘价 `close`。示例见仓库 `examples/13_adj_returns_signal.py`。
+
+```python
+import akquant as aq
+from akquant import Strategy
+
+class AdjSignal(Strategy):
+    warmup_period = 5
+    def on_bar(self, bar):
+        try:
+            x = self.get_history(2, bar.symbol, "adj_close")
+        except Exception:
+            return
+        if x is None or len(x) < 2:
+            return
+        r = x[-1] / x[-2] - 1.0
+        pos = self.get_position(bar.symbol)
+        if pos == 0 and r > 0:
+            self.buy(bar.symbol, 100)
+        elif pos > 0 and r < 0:
+            self.close_position(bar.symbol)
+```
+
 ### 3.1 双均线策略 (Dual Moving Average)
 
 **核心思想**：
