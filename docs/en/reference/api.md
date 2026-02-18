@@ -143,7 +143,7 @@ Strategy base class. Users should inherit from this class and override callback 
 
 **Data & Utilities:**
 
-*   `get_history(count, symbol, field="close") -> np.ndarray`: Get history data array (Zero-Copy).
+*   `get_history(count, symbol, field="close") -> np.ndarray`: Get history data array (Zero-Copy). Supports `open/high/low/close/volume` and any numeric extra fields (e.g., `adj_close`, `adj_factor`).
 *   `get_history_df(count, symbol) -> pd.DataFrame`: Get history data DataFrame (OHLCV).
 *   `get_position(symbol) -> float`: Get current position size.
 *   `get_cash() -> float`: Get current available cash.

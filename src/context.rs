@@ -255,7 +255,17 @@ impl StrategyContext {
                     "low" => PyArray1::from_iter(py, history.lows.iter().skip(start).cloned()),
                     "close" => PyArray1::from_iter(py, history.closes.iter().skip(start).cloned()),
                     "volume" => PyArray1::from_iter(py, history.volumes.iter().skip(start).cloned()),
-                    _ => return Err(pyo3::exceptions::PyValueError::new_err("Invalid field")),
+                    _ => {
+                        if let Some(series) = history.extras.get(&field) {
+                            PyArray1::from_iter(py, series.iter().skip(start).cloned())
+                        } else {
+                            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                                "Invalid field: '{}'. Available extra fields: {:?}",
+                                field,
+                                history.extras.keys()
+                            )));
+                        }
+                    }
                 };
 
                 return Ok(Some(py_array));

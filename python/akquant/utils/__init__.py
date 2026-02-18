@@ -299,6 +299,14 @@ def df_to_arrays(
         dt_series_s = dt_series_s.dt.tz_localize("Asia/Shanghai")
     dt_series_s = dt_series_s.dt.tz_convert("UTC")
 
+    # Force nanosecond resolution before converting to int64
+    if not str(dt_series_s.dtype).startswith("datetime64[ns"):
+        try:
+            dt_series_s = dt_series_s.astype("datetime64[ns, UTC]")
+        except Exception:
+            # Fallback for older pandas or incompatible types
+            pass
+
     timestamps = cast(np.ndarray, dt_series_s.astype("int64").values)
 
     # 2. Extract numeric columns

@@ -21,6 +21,31 @@
 
 Here are some common quantitative strategy implementations that you can use directly in your projects. We provide detailed logic explanations for each strategy to help you understand the core concepts.
 
+### Use Adjusted Series for Signals, Real Prices for Execution
+
+When your data provides `adj_close` or `adj_factor`, you can fetch adjusted series directly via `get_history(symbol=..., field="adj_close", n)` for signal computation, while matching and valuation still use real `close`. See `examples/13_adj_returns_signal.py`.
+
+```python
+import akquant as aq
+from akquant import Strategy
+
+class AdjSignal(Strategy):
+    warmup_period = 5
+    def on_bar(self, bar):
+        try:
+            x = self.get_history(2, bar.symbol, "adj_close")
+        except Exception:
+            return
+        if x is None or len(x) < 2:
+            return
+        r = x[-1] / x[-2] - 1.0
+        pos = self.get_position(bar.symbol)
+        if pos == 0 and r > 0:
+            self.buy(bar.symbol, 100)
+        elif pos > 0 and r < 0:
+            self.close_position(bar.symbol)
+```
+
 ### 3.1 Dual Moving Average Strategy
 
 **Core Concept**:

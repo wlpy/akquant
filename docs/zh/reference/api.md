@@ -143,7 +143,7 @@ class InstrumentConfig:
 
 **数据与工具:**
 
-*   `get_history(count, symbol, field="close") -> np.ndarray`: 获取历史数据数组 (Zero-Copy)。
+*   `get_history(count, symbol, field="close") -> np.ndarray`: 获取历史数据数组 (Zero-Copy)。支持 `open/high/low/close/volume` 以及任何数值型扩展字段（例如 `adj_close`, `adj_factor`）。
 *   `get_history_df(count, symbol) -> pd.DataFrame`: 获取历史数据 DataFrame (OHLCV)。
 *   `get_position(symbol) -> float`: 获取当前持仓量。
 *   `get_cash() -> float`: 获取当前可用资金。
