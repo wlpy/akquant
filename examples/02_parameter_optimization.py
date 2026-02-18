@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from akquant import Indicator, Strategy, run_optimization
+from akquant import Indicator, Strategy, run_grid_search
 
 
 class SMACrossStrategy(Strategy):
@@ -83,7 +83,7 @@ if __name__ == "__main__":
 
     # 运行
     # max_workers=2 for demo safety
-    results = run_optimization(
+    results = run_grid_search(
         strategy=SMACrossStrategy,
         param_grid=param_grid,
         data=df,

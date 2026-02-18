@@ -85,13 +85,32 @@
     git push origin feature/my-new-feature
     ```
 
-### 5. 提交 Pull Request (PR)
+### 6. 测试与验证 (Testing)
 
-1.  回到 GitHub 你的仓库页面。
-2.  你会看到 "Compare & pull request" 的提示，点击它。
-3.  **重要**: 将 `base repository` 的分支选择为 **`dev`** (而不是 `main`)。
-4.  填写 PR 描述，说明你做了什么修改。
-5.  点击 "Create pull request"。
+为确保代码质量与回测结果的一致性，本项目引入了**黄金测试套件 (Golden Test Suite)**。
+
+1.  **运行常规单元测试**:
+    ```bash
+    pytest
+    ```
+
+2.  **运行黄金测试 (Golden Tests)**:
+    黄金测试用于捕捉核心算法变更导致的非预期行为（如 PnL 计算、撮合逻辑差异）。
+    ```bash
+    pytest tests/golden/test_golden.py
+    ```
+    *   如果测试失败，请检查差异是否符合预期。
+    *   如果是**预期内的算法改进**（例如修复了撮合 bug 导致成交价格变动），你需要更新基线：
+        ```bash
+        python tests/golden/runner.py --generate-baseline
+        ```
+        并在 PR 中说明导致基线变更的原因。
+
+3.  **代码风格检查**:
+    ```bash
+    ruff check .
+    mypy .
+    ```
 
 ---
 

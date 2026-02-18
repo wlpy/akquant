@@ -61,11 +61,13 @@ plugins:
             Data Guide: 数据指南
             Visualization: 可视化与报告
             Result Analysis: 回测结果详解
+            Optimization Guide: 参数优化
             Examples: 示例集合
             Advanced Topics: 进阶专题
             ML Guide: 机器学习
             LLM Guide: LLM 辅助
             Timezone Handling: 时区处理
+            Testing Guide: 测试指南
             API Reference: API 参考
             Architecture & Internals: 架构与原理
             Architecture: 系统架构
@@ -86,11 +88,13 @@ plugins:
             Data Guide: Data Guide
             Visualization: Visualization
             Result Analysis: Result Analysis
+            Optimization Guide: Parameter Optimization
             Examples: Examples
             Advanced Topics: Advanced Topics
             ML Guide: ML Guide
             LLM Guide: LLM Guide
             Timezone Handling: Timezone Handling
+            Testing Guide: Testing Guide
             API Reference: API Reference
             Architecture & Internals: Architecture & Internals
             Architecture: Architecture
@@ -110,11 +114,13 @@ nav:
       - Data Guide: guide/data.md
       - Visualization: guide/visualization.md
       - Result Analysis: guide/analysis.md
+      - Optimization Guide: guide/optimization.md
       - Examples: guide/examples.md
   - Advanced Topics:
       - ML Guide: advanced/ml.md
       - LLM Guide: advanced/llm.md
       - Timezone Handling: advanced/timezone.md
+      - Testing Guide: guide/testing.md
   - API Reference: reference/api.md
   - Architecture & Internals:
       - Architecture: meta/architecture.md
