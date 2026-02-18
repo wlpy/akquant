@@ -6,6 +6,8 @@ try:
 except metadata.PackageNotFoundError:
     __version__ = "0.0.0+unknown"
 
+__engine_rule_version__ = "1.0.0"  # Increment on behavior-changing updates
+
 from . import akquant as _akquant
 from .akquant import *  # noqa: F403
 from .backtest import BacktestResult, run_backtest  # type: ignore
@@ -13,7 +15,7 @@ from .config import BacktestConfig, InstrumentConfig, StrategyConfig, strategy_c
 from .data import DataLoader
 from .indicator import Indicator, IndicatorSet
 from .log import get_logger, register_logger
-from .optimize import OptimizationResult, run_optimization
+from .optimize import OptimizationResult, run_grid_search, run_walk_forward
 from .plot import plot_result
 from .sizer import AllInSizer, FixedSize, PercentSizer, Sizer
 from .strategy import Strategy
@@ -38,7 +40,8 @@ if hasattr(_akquant, "__all__"):  # noqa: F405
         "run_backtest",
         "plot_result",
         "BacktestResult",
-        "run_optimization",
+        "run_grid_search",
+        "run_walk_forward",
         "OptimizationResult",
         "BacktestConfig",
         "StrategyConfig",
@@ -62,7 +65,8 @@ else:
         "run_backtest",
         "plot_result",
         "BacktestResult",
-        "run_optimization",
+        "run_grid_search",
+        "run_walk_forward",
         "OptimizationResult",
         "BacktestConfig",
         "StrategyConfig",

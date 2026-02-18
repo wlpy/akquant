@@ -693,6 +693,7 @@ def run_backtest(
             p_opt_type = _parse_option_type(i_conf.option_type)
             p_strike = i_conf.strike_price
             p_expiry = _parse_expiry(i_conf.expiry_date)
+            p_underlying = i_conf.underlying_symbol
         else:
             p_asset_type = default_asset_type
             p_multiplier = default_multiplier
@@ -703,6 +704,7 @@ def run_backtest(
             p_opt_type = default_option_type
             p_strike = default_strike_price
             p_expiry = _parse_expiry(default_expiry_date)
+            p_underlying = None
 
         instr = Instrument(
             sym,
@@ -714,6 +716,7 @@ def run_backtest(
             p_strike,
             p_expiry,
             p_lot,
+            p_underlying,
         )
         engine.add_instrument(instr)
 

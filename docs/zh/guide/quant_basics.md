@@ -126,9 +126,10 @@ print("安装成功！")
 创建一个名为 `first_strategy.py` 的文件：
 
 ```python
-import pandas as pd
 import numpy as np
-from akquant import Strategy, run_backtest
+import pandas as pd
+from akquant import Strategy, run_backtest, Bar
+
 
 class DualMovingAverageStrategy(Strategy):
     def __init__(self):
@@ -136,23 +137,23 @@ class DualMovingAverageStrategy(Strategy):
         self.short_window = 5
         self.long_window = 20
 
-    def on_bar(self, bar):
+    def on_bar(self, bar: Bar):
         # 获取历史收盘价数据
         # history_data 返回的是一个 DataFrame
-        hist = self.history_data(n=self.long_window + 1)
+        hist = self.get_history(count=self.long_window + 1, field="close")
 
         # 如果数据不足，无法计算均线，直接返回
         if len(hist) < self.long_window:
             return
 
         # 计算短期和长期均线
-        closes = hist['close'].values
+        closes = hist
         ma_short = np.mean(closes[-self.short_window:])
         ma_long = np.mean(closes[-self.long_window:])
 
         # 获取上一时刻的均线值（用于判断交叉）
-        prev_ma_short = np.mean(closes[-self.short_window-1 : -1])
-        prev_ma_long = np.mean(closes[-self.long_window-1 : -1])
+        prev_ma_short = np.mean(closes[-self.short_window - 1: -1])
+        prev_ma_long = np.mean(closes[-self.long_window - 1: -1])
 
         # 获取当前持仓
         position = self.get_position(bar.symbol)
@@ -161,22 +162,23 @@ class DualMovingAverageStrategy(Strategy):
         # 1. 金叉：短期均线上穿长期均线，且当前无持仓 -> 买入
         if prev_ma_short <= prev_ma_long and ma_short > ma_long:
             if position == 0:
-                self.buy(bar.symbol, 100) # 买入100股
-                print(f"[{bar.datetime}] 金叉买入 {bar.symbol} @ {bar.close:.2f}")
+                self.buy(bar.symbol, 100)  # 买入100股
+                print(f"[{bar.timestamp_str}] 金叉买入 {bar.symbol} @ {bar.close:.2f}")
 
         # 2. 死叉：短期均线下穿长期均线，且持有仓位 -> 卖出
         elif prev_ma_short >= prev_ma_long and ma_short < ma_long:
             if position > 0:
-                self.sell(bar.symbol, 100) # 卖出100股
-                print(f"[{bar.datetime}] 死叉卖出 {bar.symbol} @ {bar.close:.2f}")
+                self.sell(bar.symbol, 100)  # 卖出100股
+                print(f"[{bar.timestamp_str}] 死叉卖出 {bar.symbol} @ {bar.close:.2f}")
 
 # ------------------------------
 # 准备测试数据并运行
 # ------------------------------
 if __name__ == "__main__":
     # 生成模拟数据
+    np.random.seed(1024)
     dates = pd.date_range(start="2023-01-01", end="2023-12-31")
-    price = 100 + np.cumsum(np.random.randn(len(dates))) # 随机游走价格
+    price = 100 + np.cumsum(np.random.randn(len(dates)))  # 随机游走价格
 
     df = pd.DataFrame({
         "date": dates,
@@ -188,15 +190,15 @@ if __name__ == "__main__":
     # 运行回测
     print("开始回测...")
     result = run_backtest(
-        strategy_class=DualMovingAverageStrategy,
+        strategy=DualMovingAverageStrategy,
         data=df,
-        initial_capital=10000.0 # 初始资金 1万
+        initial_cash=10000.0,  # 初始资金 1万
+        warmup_period=21
     )
 
     # 打印简要结果
     print("\n回测结束！")
-    print(f"最终权益: {result.final_value:.2f}")
-    print(f"总收益率: {result.total_return * 100:.2f}%")
+    print(f"绩效指标: {result.metrics_df}")
 ```
 
 ### 3.2 进阶策略：均值回归 (Mean Reversion)
@@ -219,11 +221,11 @@ class BollingerStrategy(Strategy):
 
     def on_bar(self, bar):
         # 获取足够的历史数据
-        hist = self.history_data(n=self.window + 1)
+        hist = self.get_history(count=self.window + 1)
         if len(hist) < self.window:
             return
 
-        closes = hist['close'].values
+        closes = hist
         # 计算布林带
         ma = np.mean(closes[-self.window:])
         std = np.std(closes[-self.window:])
@@ -237,12 +239,12 @@ class BollingerStrategy(Strategy):
         # 1. 价格跌破下轨，买入（视为超跌）
         if current_price < lower and position == 0:
             self.buy(bar.symbol, 100)
-            print(f"[{bar.datetime}] 超跌买入 {bar.symbol} @ {current_price:.2f}")
+            print(f"[{bar.timestamp_str}] 超跌买入 {bar.symbol} @ {current_price:.2f}")
 
         # 2. 价格回归中轨或突破上轨，卖出（止盈）
         elif (current_price > ma or current_price > upper) and position > 0:
             self.sell(bar.symbol, 100)
-            print(f"[{bar.datetime}] 回归卖出 {bar.symbol} @ {current_price:.2f}")
+            print(f"[{bar.timestamp_str}] 回归卖出 {bar.symbol} @ {current_price:.2f}")
 ```
 
 ### 3.3 实战：获取真实数据
@@ -284,9 +286,9 @@ df = df[["date", "open", "high", "low", "close", "volume", "symbol"]]
 
 # 直接传入 run_backtest
 result = run_backtest(
-    strategy_class=DualMovingAverageStrategy,
+    strategy=DualMovingAverageStrategy,
     data=df,
-    initial_capital=10000.0
+    initial_cash=10000.0
 )
 ```
 
@@ -299,15 +301,7 @@ AKQuant 提供了内置的绘图功能（基于 `matplotlib`）。
 # 在 run_backtest 后添加
 
 # 绘制资金曲线
-result.plot()
-# 或者使用更详细的绘图工具（如果已安装 matplotlib）
-import matplotlib.pyplot as plt
-
-plt.figure(figsize=(12, 6))
-plt.plot(result.equity_curve, label='Strategy Equity')
-plt.title('Strategy Performance')
-plt.legend()
-plt.show()
+result.report(show=True)
 ```
 
 ### 3.5 参数调优 (Parameter Optimization)
@@ -316,23 +310,39 @@ plt.show()
 这就是**参数调优**要做的事。我们可以遍历不同的参数组合，找到历史表现最好的一组。
 
 ```python
-# 简单的网格搜索示例
-best_sharpe = -100
-best_params = (0, 0)
+from akquant import run_grid_search
 
-for short_w in range(3, 10):
-    for long_w in range(15, 30):
-        if short_w >= long_w: continue
+# 1. 调整策略类以接收参数
+class OptimizedDualMA(DualMovingAverageStrategy):
+    def __init__(self, short_window=5, long_window=20):
+        self.short_window = short_window
+        self.long_window = long_window
 
-        # 动态修改策略参数（需稍微调整策略类以支持传入参数）
-        # 这里仅为伪代码演示思路
-        print(f"Testing: short={short_w}, long={long_w}...")
-        # result = run_backtest(...)
-        # if result.sharpe_ratio > best_sharpe:
-        #     best_sharpe = result.sharpe_ratio
-        #     best_params = (short_w, long_w)
+# 2. 定义参数网格
+param_grid = {
+    "short_window": range(3, 10),  # 3 到 9
+    "long_window": range(15, 30)   # 15 到 29
+}
 
-print(f"最佳参数: {best_params}, 夏普比率: {best_sharpe}")
+# 3. 运行网格搜索
+# AKQuant 会自动组合所有参数，并利用多核 CPU 并行计算
+results = run_grid_search(
+    strategy=OptimizedDualMA,
+    param_grid=param_grid,
+    data=df,
+    initial_cash=10000.0,
+    sort_by="sharpe_ratio",  # 按夏普比率排序
+    max_workers=4            # 并行进程数
+)
+
+# 4. 获取最佳结果
+# results 是一个 DataFrame，包含参数和回测指标
+print("优化结果前5名：")
+print(results.head())
+
+best_params = results.iloc[0]
+print(f"\n最佳参数: short={best_params['short_window']}, long={best_params['long_window']}")
+print(f"最佳夏普: {best_params['sharpe_ratio']:.4f}")
 ```
 > **注意**：参数调优容易导致**过拟合**，请务必在样本外数据（Out-of-Sample）上进行验证。
 
@@ -362,7 +372,7 @@ print(f"最佳参数: {best_params}, 夏普比率: {best_sharpe}")
 - **原因**：计算20日均线至少需要20条历史数据。在回测刚开始的前几天，数据累积不足。
 - **解决**：在 `on_bar` 开头添加检查：
     ```python
-    if len(self.history_data(n=20)) < 20:
+    if len(self.get_history(count=20)) < 20:
         return
     ```
 

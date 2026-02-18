@@ -20,6 +20,7 @@ class InstrumentConfig:
     option_type: Optional[str] = None  # CALL, PUT
     strike_price: Optional[float] = None
     expiry_date: Optional[str] = None
+    underlying_symbol: Optional[str] = None
 
 
 @dataclass

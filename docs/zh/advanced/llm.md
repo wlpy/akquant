@@ -204,7 +204,77 @@ class MLStrategy(Strategy):
 ```
 ````
 
-## 3. 常见场景 Prompt 示例
+## 3. 核心 Prompt 模板 (参数优化)
+
+如果用户需要进行策略参数优化（Grid Search 或 Walk-Forward），请使用此模板。
+
+````markdown
+### AKQuant Optimization Rules
+
+1.  **Optimization Functions**:
+    *   `akquant.run_grid_search`: For standard grid search on full dataset.
+    *   `akquant.run_walk_forward`: For rolling window optimization (train/test split).
+
+2.  **Key Parameters**:
+    *   `param_grid`: Dict where keys are parameter names and values are lists of candidates.
+    *   `sort_by`: Metric(s) to sort results. Can be a single string (e.g., `"sharpe_ratio"`) or a list (e.g., `["sharpe_ratio", "total_return"]`).
+    *   `ascending`: Boolean or list of booleans matching `sort_by`. `False` means descending (higher is better).
+    *   `result_filter`: Callable `f(metrics: dict) -> bool`. Use this to filter out results with few trades or high drawdown (e.g., `metrics['trade_count'] < 50`).
+
+3.  **Callbacks**:
+    *   **Warmup**: `warmup_calc(params) -> int`. Dynamic warmup period based on parameters (e.g., `params['long_window'] + 1`).
+    *   **Constraint**: `constraint(params) -> bool`. Filter invalid parameter combinations (e.g., `short_window >= long_window`).
+
+### Example Optimization Code (Reference)
+
+```python
+from akquant import run_grid_search, run_walk_forward
+import pandas as pd
+
+# 1. Define Parameter Grid
+param_grid = {
+    "short_window": range(5, 20, 5),
+    "long_window": range(20, 60, 10)
+}
+
+# 2. Define Filters
+def result_filter(metrics):
+    # Ensure statistical significance and risk control
+    return (
+        metrics.get("trade_count", 0) >= 30 and
+        metrics.get("max_drawdown_pct", 1.0) < 0.25
+    )
+
+def param_constraint(params):
+    return params["short_window"] < params["long_window"]
+
+# 3. Run Grid Search (Multi-Objective)
+results = run_grid_search(
+    strategy=MyStrategy,
+    param_grid=param_grid,
+    data=df,
+    sort_by=["sharpe_ratio", "calmar_ratio"], # Primary: Sharpe, Secondary: Calmar
+    ascending=[False, False],
+    result_filter=result_filter,
+    constraint=param_constraint
+)
+
+# 4. Run Walk-Forward Optimization
+wfo_results = run_walk_forward(
+    strategy=MyStrategy,
+    param_grid=param_grid,
+    data=df,
+    train_period=252,    # 1 year training
+    test_period=63,      # 3 months testing
+    metric=["sharpe_ratio", "total_return"], # Multi-objective sort
+    ascending=[False, False],
+    result_filter=result_filter,
+    constraint=param_constraint
+)
+```
+````
+
+## 4. 常见场景 Prompt 示例
 
 ### 场景 A：编写一个双均线策略
 
@@ -226,7 +296,7 @@ Requirements:
 4.  Validation: Walk-Forward, train on 500 bars, retrain every 100 bars.
 5.  Implement `prepare_features` correctly handling both training and inference modes."
 
-## 4. 进阶技巧与排错 (Advanced Tips & Troubleshooting)
+## 5. 进阶技巧与排错 (Advanced Tips & Troubleshooting)
 
 ### 4.1 详细回测结果分析
 

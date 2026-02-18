@@ -767,3 +767,10 @@ def from_arrays(
 ) -> list[Bar]:
     r"""从数组批量创建 Bar 列表 (Python 优化用 - Zero Copy)."""
     ...
+
+def grid_search(
+    strategy: typing.Any,
+    param_grid: typing.Mapping[str, typing.Sequence[typing.Any]],
+    data: typing.Any = ...,
+    max_workers: typing.Optional[int] = ...,
+) -> typing.Any: ...

@@ -171,6 +171,27 @@ result.report(show=True)
 *   📚 **[API 参考](docs/zh/api.md)**: 详细的类与函数文档。
 *   💻 **[贡献指南](CONTRIBUTING.md)**: 如何参与项目开发。
 
+## 🧪 测试与质量保证
+
+AKQuant 采用严格的测试流程以确保回测引擎的准确性：
+
+*   **单元测试**: 覆盖核心 Rust 组件与 Python 接口。
+*   **黄金测试 (Golden Tests)**: 使用合成数据验证关键业务逻辑（如 T+1、涨跌停、保证金、期权希腊值），并与锁定的基线结果进行比对，防止算法回退。
+
+运行测试：
+```bash
+# 1. 安装开发依赖
+pip install -e ".[dev]"
+
+# 2. 运行所有测试
+pytest
+
+# 3. 仅运行黄金测试
+pytest tests/golden/test_golden.py
+```
+
+## 贡献指南
+
 ## Citation
 
 Please use this bibtex if you want to cite this repository in your publications:
